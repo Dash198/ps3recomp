@@ -1187,6 +1187,7 @@ extern "C" void ppu_guard_page(uint32_t guest_ea) { (void)guest_ea; }
  * instead of a host segfault -- so a first-boot run reveals the next wall
  * rather than dying. */
 extern "C" uint32_t ppu_vm_size = 0;
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 
 /* PT_TLS template (captured by ppu_load_elf) + the main thread's TLS image.
  * PPC64 ELF TLS: r13 (thread pointer) = image_base + 0x7000. The image sits in
@@ -1211,7 +1212,56 @@ static int vm_oob_report(uint32_t a, uint32_t n)
     {
         static int logged = 0;
         if (logged < 40) {
-            fprintf(stderr, "[vm] OOB access 0x%08X (+%u)\n", a, n);
+            char who[64];
+            ppu_guest_caller(who, sizeof who);
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            if (g_active_ctx) {
+                fprintf(stderr,
+                        "[vm] OOB access 0x%08X (+%u) guest-fn=%s cia=0x%08X "
+                        "lr=0x%08X tid=%llu r3=0x%08X r4=0x%08X r9=0x%08X "
+                        "r10=0x%08X r11=0x%08X r12=0x%08X\n",
+                        a, n, who, (uint32_t)g_active_ctx->cia,
+                        (uint32_t)g_active_ctx->lr,
+                        (unsigned long long)g_active_ctx->thread_id,
+                        (uint32_t)g_active_ctx->gpr[3],
+                        (uint32_t)g_active_ctx->gpr[4],
+                        (uint32_t)g_active_ctx->gpr[9],
+                        (uint32_t)g_active_ctx->gpr[10],
+                        (uint32_t)g_active_ctx->gpr[11],
+                        (uint32_t)g_active_ctx->gpr[12]);
+            } else {
+                fprintf(stderr, "[vm] OOB access 0x%08X (+%u) guest-fn=%s\n", a, n, who);
+            }
+            /* GT6's first failure is a lookup miss through a bad array entry.
+             * Dump that table only when explicitly requested; it is title- and
+             * address-specific diagnostic data, not part of normal VM checking. */
+            static int lookup_dumped = 0;
+            if (!lookup_dumped && getenv("GT6_LOOKUP_TRACE") && vm_base &&
+                a >= 0xFFFFFF00u) {
+                lookup_dumped = 1;
+                auto read_guest32 = [](uint32_t ea) -> uint32_t {
+                    return __builtin_bswap32(*(const uint32_t*)(vm_base + ea));
+                };
+                const uint32_t root = 0x01682AA0u;
+                const uint32_t output = 0x01733CD0u;
+                uint32_t records = read_guest32(root + 0);
+                uint32_t count = read_guest32(root + 4);
+                fprintf(stderr,
+                        "[gt6-lookup] root=0x%08X records=0x%08X count=%u "
+                        "output=0x%08X\n",
+                        root, records, count, output);
+                if (records >= 0x10000u && count <= 64u &&
+                    (!ppu_vm_size || records + count * 8u <= ppu_vm_size)) {
+                    for (uint32_t i = 0; i < count; i++) {
+                        uint32_t node = records + i * 8u;
+                        fprintf(stderr, "[gt6-lookup] rec[%u] @0x%08X key=0x%08X value=0x%08X\n",
+                                i, node, read_guest32(node), read_guest32(node + 4));
+                    }
+                }
+            }
+            if (logged == 0 && getenv("GT6_LOOKUP_TRACE") && g_active_ctx) {
+                ppu_dump_guest_stack(g_active_ctx, "gt6-oob");
+            }
 #ifdef _WIN32
             /* one-shot backtrace on the first OOB so the lifted caller is known */
             static int bt = 0;
@@ -1557,7 +1607,16 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+uint32_t vm_read32(uint64_t a) {
+    if (vm_oob((uint32_t)a,4)) {
+        if (getenv("GT6_LOOKUP_TRACE")) {
+            void* ra = __builtin_return_address(0);
+            fprintf(stderr, "[vm-callsite] vm_read32 ea=0x%08X ra=%p guest-fn=0x%08X\n",
+                    (uint32_t)a, ra, ppu_prof_resolve_host(ra));
+        }
+        return 0;
+    }
+    ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU

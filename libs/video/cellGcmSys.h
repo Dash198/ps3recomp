@@ -72,7 +72,7 @@ extern "C" {
 #define CELL_GCM_LOCATION_MAIN          1  /* main memory */
 
 /* IO mapping limits */
-#define CELL_GCM_MAX_IO_MAPPINGS        16
+#define CELL_GCM_MAX_IO_MAPPINGS        128
 
 /* Debug output levels */
 #define CELL_GCM_DEBUG_LEVEL0           0

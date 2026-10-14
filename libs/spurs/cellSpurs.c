@@ -1484,16 +1484,37 @@ static WklPm* spurs_resolve_pm(u32 wid)
     WklPm* r = &s_wkl_pm[wid];
     if (r->resolved) return r->resolved > 0 ? r : NULL;
     SpursWorkload* w = &s_workloads[wid];
-    uint64_t fp = spu_workload_fingerprint(vm_base + (uint32_t)(uintptr_t)w->pm,
-                                           w->sizePm);
+    const uint8_t* pm = vm_base + (uint32_t)(uintptr_t)w->pm;
+    uint64_t fp = spu_workload_fingerprint(pm, w->sizePm);
     r->fn = spu_workload_find_img(fp, &r->image_id);
     r->resolved = r->fn ? 1 : -1;
     if (r->fn)
         printf("[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
                wid, (unsigned long long)fp, r->image_id);
-    else
+    else {
         printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will not run\n",
                wid, (unsigned long long)fp, w->sizePm);
+        /* Policy modules are raw SPU code+data blobs loaded by the game, not
+         * embedded SPU ELFs. Keep the dump opt-in and write each fingerprint
+         * once so a missing module can be lifted without changing normal logs. */
+        const char* dump_dir = getenv("SPU_DUMP_PM_MISS");
+        if (dump_dir && *dump_dir) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/spupm_%016llX_%u.bin",
+                     dump_dir, (unsigned long long)fp, w->sizePm);
+            FILE* file = fopen(path, "rb");
+            if (!file) {
+                file = fopen(path, "wb");
+                if (file) {
+                    fwrite(pm, 1, w->sizePm, file);
+                    fclose(file);
+                    printf("[cellSpurs] dumped missing PM -> %s\n", path);
+                }
+            } else {
+                fclose(file);
+            }
+        }
+    }
     return r->fn ? r : NULL;
 }
 
