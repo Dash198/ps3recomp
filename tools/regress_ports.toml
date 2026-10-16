@@ -112,6 +112,37 @@ port_build = """python "{toolkit}/tools/gen_hle_nids.py" --all --out src/gen/ppu
 # Their goldens were recorded under the broken root, so they describe titles that
 # could not load an asset. Re-record both.
 
+# --- the title under active development -------------------------------------
+
+# GT6 breaks the "../ps3games/<title>" layout every other port assumes: its
+# toolkit checkout lives INSIDE the game workspace (gt6recomp/ps3recomp), so
+# from here the port is "../gt6", while the guest VFS and the lift sit one level
+# above both ("../vfs", "{toolkit}/../recomp"). Three consequences:
+#
+#   * RECOMP_DIR points outside the port tree, so it is passed explicitly and
+#     absolutely ({toolkit}/../recomp). The lift is git-ignored and this gate
+#     does NOT regenerate it -- with no ppu_recomp.h there, the port will not
+#     configure.
+#   * the default port_build regenerates src/gen/ppu_hle_nids.cpp in place. GT6
+#     has no such file; its CMakeLists generates the table into build-gate/ from
+#     the toolkit under test, so that step is dropped and the rest is the same.
+#   * --parallel 2 is not a preference. The ten lifted PPU translation units are
+#     ~35 MB of machine-generated C++ each; measured at -O3, one peaks at
+#     ~1.3 GB RSS. This machine has 16 cores and 15 GB of RAM, so the default
+#     parallelism starts ten of them at once and the build is OOM-killed.
+#
+# The SPU images under gt6/spu/ are git-ignored too; the port builds and runs
+# without them, but a lift from a tree that has them reaches further, so the
+# golden below assumes a workspace that also holds its SPU lift.
+[[port]]
+name    = "gt6"
+dir     = "../gt6"
+build   = """cmake -S . -B build-gate -G "{generator}" -DCMAKE_C_COMPILER={cc} -DCMAKE_CXX_COMPILER={cxx} -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_DIR="{toolkit}" -DRECOMP_DIR="{toolkit}/../recomp" && cmake --build build-gate --parallel 2"""
+cmd     = ["build-gate/MyGameRecomp", "../vfs/USRDIR/EMAIN.elf"]
+timeout = 90
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "../vfs" }
+
 # --- showcase titles -------------------------------------------------------
 
 [[port]]

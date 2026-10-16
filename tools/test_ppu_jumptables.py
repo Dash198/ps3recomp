@@ -49,8 +49,10 @@ def w_blr():               return (19 << 26) | (20 << 21) | (16 << 1)
 def w_ld(rt, ra, d):       return (58 << 26) | (rt << 21) | (ra << 16) | (d & 0xFFFC)
 def w_std(rs, ra, d):      return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC)
 def w_li(rt, si):          return (14 << 26) | (rt << 21) | (si & 0xFFFF)
+def w_addi(rt, ra, si):    return (14 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
 def w_addis(rt, ra, si):   return (15 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
 def w_stdu(rs, ra, d):     return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC) | 1
+def w_subf(rt, ra, rb):   return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (40 << 1)
 def w_bc(bo, bi, rel):     return (16 << 26) | (bo << 21) | (bi << 16) | (rel & 0xFFFC)
 
 
@@ -257,6 +259,9 @@ def main() -> int:
     test_base_before_fallthrough_split()
     test_const_base_no_table()
     test_const_base_needs_constant()
+    test_const_base_lis_addi()
+    test_const_base_subf_descending()
+    test_const_base_subf_wrong_operand_is_not_the_idiom()
     test_multi_toc_prefers_targets_near_the_dispatcher()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
@@ -290,5 +295,57 @@ def test_const_base_needs_constant():
     check("non-constant base is not a constant-base jump", got, None)
 
 
+def test_const_base_lis_addi():
+    """Offset table where the base is formed with lis + addi (immediate arithmetic)."""
+    base = TEXT_LO + 0x40
+    # Table entries at base: case 0 -> base + 0x20, case 1 -> base + 0x28
+    mem = {
+        base: 0x20,
+        base + 4: 0x28,
+    }
+    hi = (base >> 16) & 0xFFFF
+    lo = (base & 0xFFFF)
+    if lo >= 0x8000:
+        lo -= 0x10000
+        hi = (hi + 1) & 0xFFFF
+    got = discover([w_addis(9, 0, hi), w_slwi(11, 3, 2), w_addi(9, 9, lo),
+                    w_lwzx(0, 11, 9), w_add(0, 0, 9), w_mtctr(0), w_bctr()], mem)
+    check("constant-base offset table (lis + addi)", got, [base + 0x20, base + 0x28])
+
+
+def test_const_base_subf_descending():
+    """SDK memset's `subf` tail: `subf rC,rIdx,rC` walks the run DOWNWARD.
+
+        lis r8,hi ; addi r8,r8,lo ; subf r8,r7,r8 ; mtctr r8 ; bctr
+        base-0x3C .. base: the unrolled store tail, `blr` at base.
+
+    GT6 func_00A8DE98. The block right after the bctr is the landing run, and
+    the constant is its LAST address. Recognised as `add` only, the whole run
+    was dropped and every short memset lifted to an unresolved indirect call
+    that stored nothing.
+    """
+    base = TEXT_LO + 0x50
+    n = 16
+    mem = {base - 4 * k: w_stdu(4, 3, 8) for k in range(n - 1)}
+    mem[base] = w_blr()
+    hi, lo = (base >> 16) & 0xFFFF, base & 0xFFFF
+    got = discover([w_addis(8, 0, hi), w_addi(8, 8, lo), w_subf(8, 7, 8),
+                    w_mtctr(8), w_bctr()], mem)
+    check("constant-base descending run (subf)", got,
+          [base - 4 * (n - 1) + 4 * k for k in range(n)])
+
+
+def test_const_base_subf_wrong_operand_is_not_the_idiom():
+    """`subf r8,r8,r7` computes r7 - r8: the constant is the SUBTRAHEND, so
+    r8 is not a constant and this must not be taken as a constant-base jump."""
+    base = TEXT_LO + 0x50
+    mem = {base: w_blr(), base - 4: w_stdu(4, 3, 8)}
+    got = discover([w_addis(8, 0, (base >> 16) & 0xFFFF),
+                    w_addi(8, 8, base & 0xFFFF), w_subf(8, 8, 7),
+                    w_mtctr(8), w_bctr()], mem)
+    check("subf with the constant as subtrahend is not the idiom", got, None)
+
+
 if __name__ == "__main__":
     sys.exit(main())
+

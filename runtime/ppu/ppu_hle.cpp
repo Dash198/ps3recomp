@@ -92,6 +92,18 @@ extern "C" const char* g_last_hle_name = "";
 #define PS3_HLE_INFLIGHT_MAX 64
 extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
 
+/* The name of the HLE handler running on guest thread `tid` right now, or NULL.
+ *
+ * The fault reporters need this because an imported function is reached through
+ * a lifted STUB -- literally `ps3_hle_call(nid, ctx); return;` -- so the guest
+ * PC and the guest back chain can only ever name the stub. "func_0101ACE8" is
+ * true and useless; "sys_initialize_tls" is the answer. Read through a function
+ * so the array size stays private to this file. */
+extern "C" const char* ps3_hle_inflight_name(uint64_t tid)
+{
+    return tid < PS3_HLE_INFLIGHT_MAX ? g_hle_inflight[(unsigned)tid] : nullptr;
+}
+
 /* Real-PRX bridge: a loaded system PRX (libsre = cellSpurs/cellSync) may export
  * this NID. If so, dispatch into the REAL recompiled Sony code (its OPD -> our
  * indirect dispatcher -> the registered lifted libsre function) instead of the

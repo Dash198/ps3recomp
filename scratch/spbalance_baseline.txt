@@ -1,0 +1,11 @@
+# spbalance.py baseline -- generated file, do not hand-edit.
+# key<TAB>count, one per line, sorted by key.
+# checkable_bodies must not decrease (coverage ratchet).
+checkable_bodies	17216
+context_restore_call_sites	3
+context_restores	1
+context_restores_unhandled	0
+imbalanced_bodies	0
+longjmp_hooks	1
+r1_move_functions	105
+setjmp_guard_sites	22
