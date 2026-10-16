@@ -43,6 +43,12 @@ python tools/dwarf_line.py EBOOT.elf 0x004F4A98
 
 Self-checks (no binary needed): `test_unfself.py`, `test_dwarf.py`, `test_nid_from_protos.py`.
 
+> **No prototype build for a title?** `nid_harvest.py` needs symbols, and firmware is
+> not a substitute — a PS3 PRX export table carries `(library, NID)` and no per-export
+> names. `tools/nid_from_strings.py` is the fallback: it harvests candidate names from
+> any binary's plain strings and verifies each with `compute_nid(name) == NID`. Same
+> proof, weaker coverage. See `docs/NID_SYSTEM.md`.
+
 ---
 
 ## What the ground truth found

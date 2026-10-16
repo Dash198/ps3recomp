@@ -14,10 +14,12 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 6. [spu_disasm.py — SPU Disassembler](#spu_disasmpy)
 7. [find_functions.py — Function Boundary Detection](#find_functionspy)
 8. [nid_database.py — NID Resolver](#nid_databasepy)
-9. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
-10. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
-11. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
-12. [Dependencies](#dependencies)
+9. [nid_from_strings.py — name an unknown NID from strings](#nid_from_stringspy)
+10. [import_dashboard.py — import coverage for one title](#import_dashboardpy)
+11. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
+12. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
+13. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
+14. [Dependencies](#dependencies)
 
 ---
 
@@ -510,6 +512,68 @@ The NID database is stored as a JSON file with entries organized by module:
     }
 }
 ```
+
+---
+
+## nid_from_strings.py
+
+**Purpose:** put a *name* to an unknown NID, given only a binary whose strings mention
+Sony's API names.
+
+A NID is `SHA-1(name + suffix)[:4]`, so it cannot be inverted: naming one means
+producing a candidate name and checking `compute_nid(name) == NID`. This tool harvests
+every firmware-shaped identifier from a binary's string data (an emulator, an
+SDK-linked tool, a debug build), hashes each, and looks the NID up in that gazetteer.
+A hit is definitive, not a guess, and a NID whose candidates disagree is refused
+rather than resolved to one of them. No external `strings` dependency.
+
+Firmware PRXs cannot do this: a PS3 export table carries `(library, NID)` and no
+per-export names, so `PS3UPDAT.PUP` can confirm a library and nothing else. This is
+the fallback for when no symbol-bearing build (`tools/nid_harvest.py`'s input) exists.
+
+### Usage
+
+```bash
+# What is this NID, given the strings in this binary?
+python tools/nid_from_strings.py <binary> --lookup 0x1F71ECBE
+#   0x1F71ECBE  cellKbGetConfiguration  [rpcs3]
+
+# Name a whole import table; emit a file nid_database.py can load
+python tools/nid_from_strings.py <binary> --imports EMAIN.imports.json \
+       --only-unknown --out nid_from_strings.json
+```
+
+Candidate names still have to be added to `nid_database.py`'s curated list to be used
+at resolution time; `tools/test_nid_from_strings.py` pins that direction (`--lookup`
+finds the name) as well as the hash.
+
+---
+
+## import_dashboard.py
+
+**Purpose:** for one title's import table, show how much of it is named, implemented
+and actually reached — the work queue that otherwise only a crash reveals.
+
+Joins four sources: the port's import table × `nid_database.py` names × the handler set
+the runtime really registers (the generated table plus explicit `ps3_hle_register*()`
+calls, so this column cannot drift from a build) × `docs/MODULE_STATUS.md` × an
+optional milestone log (`hle:` / `hle:unresolved:` keys). Classes: **implemented**,
+**partial**, **unrated**, **missing**, plus **unnamed**.
+
+### Usage
+
+```bash
+python tools/import_dashboard.py --imports EMAIN.imports.json \
+       --log run.txt --extra-src ../gt6/stubs.cpp --notes --check
+```
+
+`--extra-src` is the port's own registration source (`stubs.cpp`); without it a port's
+own handlers look missing. A registration the port could not name
+(`cellUsbd_7FE92C54`) is shown as `(stub: …)` and does **not** count as named.
+
+`--check` fails on the two things that are defects rather than queue: a *called*
+import that is unnamed, and a static/runtime contradiction (a handler exists but the
+log says the NID ran unresolved).
 
 ---
 

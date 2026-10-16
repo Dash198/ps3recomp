@@ -465,6 +465,17 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("sceNp", "sceNpBasicGetEvent"),                         # 0xe035f7d6 x4
     ("sceNp", "sceNpBasicRegisterContextSensitiveHandler"),  # 0x4026eac5 x3
     ("sceNp", "sceNpDrmIsAvailable"),                        # 0xad218faf x4
+
+    # ---- GT6's remaining unresolved imports, named by exact-NID match against a
+    # local name gazetteer (tools/nid_from_strings.py): compute_nid(name) == the
+    # imported NID, and the name fits the same library's already-named family in
+    # this list. The cellSpurs one is also confirmed by firmware libsre.prx's own
+    # export table. These five are what the gate records as hle:unresolved. ----
+    ("cellSpurs", "_cellSpursWorkloadFlagReceiver2"),         # 0x2ddbcc0a (libsre)
+    ("cellSysutil", "cellVideoOutGetScreenSize"),             # 0xfaa275a4
+    ("sysPrxForUser", "sys_mempool_create"),                  # 0xca9a60bf
+    ("cellKb", "cellKbGetConfiguration"),                     # 0x1f71ecbe
+    ("cellUsbd", "cellUsbdSetThreadPriority2"),               # 0x5c832bd7
 ]
 
 # ---------------------------------------------------------------------------
