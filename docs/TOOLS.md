@@ -16,11 +16,13 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 8. [nid_database.py — NID Resolver](#nid_databasepy)
 9. [nid_from_strings.py — name an unknown NID from strings](#nid_from_stringspy)
 10. [nid_from_rpcs3_log.py — name an unknown NID from an emulator log](#nid_from_rpcs3_logpy)
-11. [import_dashboard.py — import coverage for one title](#import_dashboardpy)
-12. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
-13. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
-14. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
-15. [Dependencies](#dependencies)
+11. [rpcs3_probe/boot.py — produce an emulator log without losing one](#rpcs3_probebootpy)
+12. [rpcs3_oracle.py — diff an emulator log against a milestone stream](#rpcs3_oraclepy)
+13. [import_dashboard.py — import coverage for one title](#import_dashboardpy)
+14. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
+15. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
+16. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
+17. [Dependencies](#dependencies)
 
 ---
 
@@ -595,6 +597,88 @@ python tools/nid_from_rpcs3_log.py RPCS3.log --out nid_from_rpcs3.json
 
 `tools/test_nid_from_rpcs3_log.py` covers the line parse, both placeholder shapes, the
 hash gate, ambiguity refusal, the CLI, and the committed gazetteer's hash invariant.
+
+---
+
+## rpcs3_probe/boot.py
+
+**Purpose:** produce an emulator log on demand, without destroying the previous one.
+
+RPCS3 **truncates `~/.cache/rpcs3/RPCS3.log` at startup** — invoking the AppImage at all,
+even `--help`, starts the logger — so the only safe way to run a title is to point
+`XDG_CACHE_HOME` somewhere else. This does that, symlinks the real `cache`/`shaderlog`/
+`spu_progs`/`ppu_progs` back in so a warm boot stays warm, backs up the config it edits
+and restores it in a `finally` (including after a SIGKILL), and treats the timeout as the
+end of the capture because RPCS3 never exits on its own.
+
+It also pins log levels for the run, which is a real, working knob: `Log:` in `config.yml`
+is a per-channel map (`<channel>: <level>`), and `PPU: Trace` really does emit millions of
+trace lines. It is **not** a way to get a call stream, though — RPCS3 logs import tables,
+not HLE calls (measured: seven lv2/HLE channels at `Trace` gave one call line in 12.6 M).
+
+### Usage
+
+```bash
+# plan only: the command, the log path, the config change; runs nothing
+python tools/rpcs3_probe/boot.py --rpcs3 <rpcs3> --title <EBOOT.BIN> --dry-run
+
+# a 150-second boot into a scratch root, log copied out
+python tools/rpcs3_probe/boot.py --rpcs3 <rpcs3> --title <EBOOT.BIN> \
+       --cache-root /tmp/opencode/rpcs3_boot --seconds 150 --out boot.log
+
+# pin levels for one run only (restored afterwards)
+python tools/rpcs3_probe/boot.py ... --log PPU:Trace,cellSpurs:Notice
+```
+
+`tools/test_rpcs3_boot.py` covers the override parse/rewrite, the isolation promise
+(the plan never targets the default log), `--dry-run` creating nothing, and the config
+being restored after both a clean exit and a kill.
+
+---
+
+## rpcs3_oracle.py
+
+**Purpose:** read an emulator's boot log as an oracle for a recompiled port's boot.
+
+`nid_from_rpcs3_log.py` mines the same log for *names*; this uses it for *behaviour*.
+RPCS3's log has no call stream, but its loader prints the import table of every module in
+order, with the library, the name, the NID and the address the call lands on — and that is
+enough to answer what a milestone stream raises:
+
+* the port wrote `hle:unresolved:0x55870804`. The oracle says that is
+  `_cellFiberPpuInitialize` from `cellFiber`, and when the title first reached it. That is
+  the **first divergence** — the earliest thing the title asked for that the port answered
+  by returning 0.
+* the port wrote `hle:some_name`. If no import table in the log has that name, the port
+  and the emulator disagree about what was called.
+
+Names go through the same hash rule as every other name source here, so an "agreement" is
+never a string coincidence. `--breakpoints` closes the loop with the GDB rig: it prints
+`tools/rpcs3_probe/probe.py` breakpoint steps at the resolved addresses.
+
+### Usage
+
+```bash
+# the report: first divergence, silent no-ops, name disagreements
+python tools/rpcs3_oracle.py boot.log --align port.milestone
+
+# name a NID, or locate a name's import
+python tools/rpcs3_oracle.py boot.log --lookup 0x30AA96C4
+
+# raw ordered stream
+python tools/rpcs3_oracle.py boot.log --dump-imports
+
+# probe.py recipes for a named import
+python tools/rpcs3_oracle.py boot.log --breakpoints _cellFiberPpuInitialize
+```
+
+Exit status is 0 when the report was produced and every `hle:` name the port used is one
+the oracle knows; it is 1 when the port used a name no import table has (a disagreement),
+because that is a defect rather than queue.
+
+`tools/test_rpcs3_oracle.py` covers the ordered stream, what may enter by name, the
+milestone parse and the buckets, the report's exit status, `--lookup`/`--breakpoints`/
+`--dump-imports`, and pins the five GT6 imports the port silently no-ops.
 
 ---
 
