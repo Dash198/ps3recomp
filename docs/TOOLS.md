@@ -857,6 +857,19 @@ It defines `ppu_hle_register_all()`, which `ppu_hle_init()` calls at startup.
 compiles this file still links — regenerate it after every toolkit update, since
 the table names handlers from the revision it was generated against.
 
+That last sentence is a real hazard, not a formality, and a port has to encode it
+in its build. GT6's `CMakeLists.txt` did not: its custom command depended on
+`gen_hle_nids.py` and `nid_database.py` only, never on the handler sources the
+table is computed *from*. After five handlers were added, the runtime library
+contained all five symbols while the gate's `build-gate/ppu_hle_nids.cpp` named
+none of them, so the guest fell through to the unresolved path — CELL_OK with
+untouched out-parameters — and the recorded golden still read
+`hle:unresolved:0x…`. Nothing in the build log said so. The libs are now
+dependencies. `tools/test_hle_answers.py` (59 checks) covers the end-to-end
+registration for the five imports that exposed it: NID identity from the name,
+the generated table actually naming each one, and the reference constants their
+bodies use.
+
 ---
 
 

@@ -66,6 +66,10 @@ typedef struct CellFiberAttribute {
 s32 cellFiberPpuInitialize(void);
 s32 cellFiberPpuFinalize(void);
 
+/* The internal initialiser the guest import tables name (see the comment on
+ * its definition): a no-op returning CELL_OK, exactly as the reference has it. */
+s32 _cellFiberPpuInitialize(void);
+
 /* Fiber lifecycle */
 s32 cellFiberPpuCreateFiber(CellFiber* fiber, CellFiberEntry entry,
                               u64 arg, const CellFiberAttribute* attr);

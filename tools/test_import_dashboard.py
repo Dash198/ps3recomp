@@ -130,12 +130,25 @@ def main() -> int:
     }
     """)
     named_impl = compute_nid("cellFsOpen")                    # handler, in the DB
-    named_missing = compute_nid("_cellSpursWorkloadFlagReceiver2")   # DB name, no handler
+    check(named_impl in handlers, "fixture: cellFsOpen must be a registered handler")
+    # A DB name with no handler. This used to be hardcoded to
+    # _cellSpursWorkloadFlagReceiver2, until Module 12 implemented it -- and a
+    # fixed NID makes this test fire on every coverage win, which is noise, not a
+    # verdict. The case only needs *a* named-but-unhandled import, so derive one
+    # from the same database the dashboard resolves names against and pin the
+    # property instead of the NID.
+    _db = dash.NIDDatabase()
+    _db.load_builtins()
+    named_missing, missing_lib, missing_name = next(
+        (nid, mod, nm) for nid, mod, nm in _db.all_entries() if nid not in handlers)
+    check(named_missing not in handlers and _db.lookup_nid(named_missing) is not None,
+          "fixture: %s (0x%08X) must be named in the DB and unregistered"
+          % (missing_name, named_missing))
     unnamed_stub = 0x0BADF00D                                 # handler, placeholder name
     unnamed_missing = 0x01010101                              # no handler, no name
     imports = [
         {"library": "cellFs", "nid": "0x%08X" % named_impl, "stub": "0x0"},
-        {"library": "cellSpurs", "nid": "0x%08X" % named_missing, "stub": "0x0"},
+        {"library": missing_lib, "nid": "0x%08X" % named_missing, "stub": "0x0"},
         {"library": "cellBar", "nid": "0x%08X" % unnamed_stub, "stub": "0x0"},
         {"library": "cellBar", "nid": "0x%08X" % unnamed_missing, "stub": "0x0"},
     ]

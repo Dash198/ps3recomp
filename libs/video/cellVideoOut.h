@@ -62,15 +62,24 @@ extern "C" {
 
 /* ---------------------------------------------------------------------------
  * Error codes
+ *
+ * Literal values, from the reference cellVideoOut.h (RPCS3). The whole enum
+ * used to be derived from CELL_ERROR_BASE_VIDEO (0x8002b100), which is NOT the
+ * cellVideoOut base: every code this module returned was off by 0x120, so a
+ * title comparing the return against the SDK's constant saw a value that is not
+ * in the enum at all (e.g. ILLEGAL_PARAMETER came back 0x8002b103 instead of
+ * 0x8002b222). Kept as literals so a future base tweak cannot silently move
+ * them again.
  * -----------------------------------------------------------------------*/
-#define CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED  (s32)(CELL_ERROR_BASE_VIDEO | 0x01)
-#define CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION (s32)(CELL_ERROR_BASE_VIDEO | 0x02)
-#define CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER (s32)(CELL_ERROR_BASE_VIDEO | 0x03)
-#define CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE (s32)(CELL_ERROR_BASE_VIDEO | 0x04)
-#define CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND (s32)(CELL_ERROR_BASE_VIDEO | 0x05)
-#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT (s32)(CELL_ERROR_BASE_VIDEO | 0x06)
-#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE (s32)(CELL_ERROR_BASE_VIDEO | 0x07)
-#define CELL_VIDEO_OUT_ERROR_CONDITION_BUSY (s32)(CELL_ERROR_BASE_VIDEO | 0x08)
+#define CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED          (s32)0x8002b220
+#define CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION    (s32)0x8002b221
+#define CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER        (s32)0x8002b222
+#define CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE   (s32)0x8002b223
+#define CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND         (s32)0x8002b224
+#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT    (s32)0x8002b225
+#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE (s32)0x8002b226
+#define CELL_VIDEO_OUT_ERROR_CONDITION_BUSY           (s32)0x8002b227
+#define CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET         (s32)0x8002b228
 
 /* ---------------------------------------------------------------------------
  * Structures

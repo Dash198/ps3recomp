@@ -30,6 +30,28 @@ extern "C" {
 #define CELL_SPURS_CORE_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x11)
 #define CELL_SPURS_CORE_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x09)
 
+/* Policy-module errors -- the SPURS *workload-flag* API (cellSpursGetWorkloadFlag
+ * / _cellSpursWorkloadFlagReceiver2) reports from this block, not the core one.
+ * Literal values from the reference cellSpurs.h (0x80410801..0x80410811); the
+ * low byte matches the core block but the base is 0x80410800, so they cannot be
+ * derived from CELL_ERROR_BASE_SPURS with `|`. */
+#define CELL_SPURS_POLICY_MODULE_ERROR_AGAIN        (s32)0x80410801
+#define CELL_SPURS_POLICY_MODULE_ERROR_INVAL        (s32)0x80410802
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOSYS        (s32)0x80410803
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOMEM        (s32)0x80410804
+#define CELL_SPURS_POLICY_MODULE_ERROR_SRCH         (s32)0x80410805
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOENT        (s32)0x80410806
+#define CELL_SPURS_POLICY_MODULE_ERROR_NOEXEC       (s32)0x80410807
+#define CELL_SPURS_POLICY_MODULE_ERROR_DEADLK       (s32)0x80410808
+#define CELL_SPURS_POLICY_MODULE_ERROR_PERM         (s32)0x80410809
+#define CELL_SPURS_POLICY_MODULE_ERROR_BUSY         (s32)0x8041080A
+#define CELL_SPURS_POLICY_MODULE_ERROR_ABORT        (s32)0x8041080C
+#define CELL_SPURS_POLICY_MODULE_ERROR_FAULT        (s32)0x8041080D
+#define CELL_SPURS_POLICY_MODULE_ERROR_CHILD        (s32)0x8041080E
+#define CELL_SPURS_POLICY_MODULE_ERROR_STAT         (s32)0x8041080F
+#define CELL_SPURS_POLICY_MODULE_ERROR_ALIGN        (s32)0x80410810
+#define CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER (s32)0x80410811
+
 #define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS | 0x21)
 #define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS | 0x22)
 #define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS | 0x23)
@@ -48,6 +70,9 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 #define CELL_SPURS_MAX_SPU                  8
 #define CELL_SPURS_MAX_WORKLOAD             16
+/* SPURS2 (cellSpursInitializeWithAttribute2, flags1 bit SF1_32_WORKLOADS)
+ * addresses 32 workloads instead of 16. */
+#define CELL_SPURS_MAX_WORKLOAD2            32
 #define CELL_SPURS_MAX_TASK                 128
 #define CELL_SPURS_MAX_TASKSET              16
 #define CELL_SPURS_MAX_PRIORITY             16
@@ -187,7 +212,18 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
                         s32 ppuPriority, u8 exitIfNoWork);
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr);
+/* The SPURS2 entry point: same attribute, an 8 KB (CellSpurs2) instance, and
+ * `flags1` bit SF1_32_WORKLOADS set so the workload space is 32 wids. */
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
 s32 cellSpursFinalize(CellSpurs* spurs);
+
+/* Workload-flag API (the SPURS job-chain command protocol between the PPU and
+ * the job-chain policy on the SPUs): hand back the instance's wklFlag, then
+ * claim (is_set=1) or release (is_set=0) the single receiver slot on it. */
+s32 cellSpursGetWorkloadFlag(CellSpurs* spurs, u32* flag);
+s32 _cellSpursWorkloadFlagReceiver2(CellSpurs* spurs, u32 wid,
+                                    u32 is_set, u32 printDebugOutput);
 
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
                                  s32 spuPriority, s32 ppuPriority,

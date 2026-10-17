@@ -87,6 +87,7 @@ s32 cellAudioOutGetNumberOfDevice(u32 audioOut);
 /* Video output extended queries */
 s32 cellVideoOutGetGamma(u32 videoOut, float* gamma);
 s32 cellVideoOutSetGamma(u32 videoOut, float gamma);
+s32 cellVideoOutGetScreenSize(u32 videoOut, float* screenSize);
 
 #ifdef __cplusplus
 }

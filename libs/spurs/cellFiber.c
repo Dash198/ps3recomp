@@ -133,6 +133,50 @@ s32 cellFiberPpuInitialize(void)
     return CELL_OK;
 }
 
+/* _cellFiberPpuInitialize() -- the entry the guest import tables actually name.
+ *
+ * The SDK exports the initialiser under an underscore (`_cellFiberPpuInitialize`,
+ * NID 0x55870804) and `cellFiberPpuInitialize` is the header's inline wrapper
+ * around it; RPCS3's cellFiber.cpp registers the underscore name and nothing
+ * else (there is no `cellFiberPpuInitialize` export anywhere in RPCS3 or in any
+ * firmware PRX, so the same-named handler above is an unreachable registration:
+ * its NID is 0x5BF7D922 and no title imports it -- kept only because
+ * tests/fiber_switch drives it directly as the host-side API).
+ *
+ * What the underscore entry must do, we know exactly: nothing the guest can see.
+ * The reference emulator implements it as
+ *
+ *     error_code _cellFiberPpuInitialize()
+ *     {
+ *         cellFiber.todo("_cellFiberPpuInitialize()");
+ *         return CELL_OK;
+ *     }
+ *
+ * i.e. no argument is read and no guest object is written; a title that calls it
+ * (GT6 calls it once, at startup) cannot tell the difference from our silent
+ * unresolved path. So this is a *documented* no-op, not a stand-in for missing
+ * work -- the point of registering it is the record: the milestone stream now
+ * says `hle:_cellFiberPpuInitialize` instead of `hle:unresolved:0x55870804`, so
+ * "answered by design" is distinguishable from "we never noticed this".
+ *
+ * It deliberately does NOT forward to cellFiberPpuInitialize() above: that
+ * installs a scheduler context and would report CELL_FIBER_ERROR_STAT on a
+ * second call, which the reference does not. GT6 also imports the five
+ * cellFiberPpuContext* entry points (ContextInitialize/Finalize/Run/
+ * ReturnToThread and _ContextAttributeInitialize) but does not call them in the
+ * boot window; *those* are the ones that need real work, and they need it
+ * against the SDK's context API, not this hook. */
+s32 _cellFiberPpuInitialize(void)
+{
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        printf("[cellFiber] _PpuInitialize() -> CELL_OK (no-op; the reference "
+               "does the same)\n");
+    }
+    return CELL_OK;
+}
+
 s32 cellFiberPpuFinalize(void)
 {
     printf("[cellFiber] Finalize()\n");

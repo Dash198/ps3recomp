@@ -418,7 +418,11 @@ enum {
     SPURS_WKL_MAXCONT  = 0x50,
     SPURS_WKL_FLAG     = 0x60,
     SPURS_WKL_SIGNAL1  = 0x70,
+    SPURS_FLAGS1       = 0x74,   /* u8: SF1_32_WORKLOADS (0x40) => 32 wids    */
     SPURS_NSPUS        = 0x76,
+    /* 0x77: which workload currently owns the wklFlag (0xFF = nobody). The
+     * PPU job-chain pump claims it with _cellSpursWorkloadFlagReceiver2. */
+    SPURS_WKL_RECEIVER = 0x77,
     SPURS_WKL_STATE1   = 0x80,
     SPURS_WKL_ENABLED  = 0xB0,
     SPURS_SYSSRV_MSG   = 0xBD,
@@ -427,8 +431,13 @@ enum {
     /* CELL_SPURS_SIZE = 4096 (SDK cell/spurs/types.h). The 8192-byte variant
      * is CellSpurs2 (cellSpursInitialize*2* NIDs) which LBP does not use —
      * clearing 0x2000 here overran the game's 4KB heap block and corrupted
-     * the allocator (abort in the job pump's first object destruction). */
+     * the allocator (abort in the job pump's first object destruction).
+     * A title that calls cellSpursInitializeWithAttribute2 allocated the 8 KB
+     * object (the reference's CellSpurs is CHECK_SIZE_ALIGN(.., 0x2000, 128)
+     * for both revisions), and its wklInfo2/wklF2/wklH2 for wids 16..31 live
+     * in 0x1000..0x1B00 -- so SPURS2 instances must clear the full 8 KB. */
     SPURS_INST_SIZE    = 0x1000,
+    SPURS_INST_SIZE2   = 0x2000,
 };
 
 #define MAX_SPURS_INST 4
@@ -448,7 +457,8 @@ static struct SpursInst* spurs_inst_find(u32 ea)
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
 
-static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix,
+                                   u32 inst_size)
 {
     struct SpursInst* si = spurs_inst_find(spurs_ea);
     if (!si) {
@@ -465,16 +475,23 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     /* Real BE instance: zero it, then the few live fields. (The global
      * workload table is NOT wiped here — the title may init several SPURS
      * instances before adding workloads to any of them.) */
-    memset(vm_base + spurs_ea, 0, SPURS_INST_SIZE);
+    memset(vm_base + spurs_ea, 0, inst_size);
     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
+    /* 0xFF = no workload owns the wklFlag yet (reference sets the receiver
+     * byte, not the flag word, at init). */
+    vm_base[spurs_ea + SPURS_WKL_RECEIVER] = 0xFF;
     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
+    /* SPURS2: advertise the 32-wid workload space in flags1 so the flag
+     * receiver's wid bound matches what the caller will use. */
+    if (inst_size > SPURS_INST_SIZE) vm_base[spurs_ea + SPURS_FLAGS1] |= 0x40u;
 
     if (!si->kernel_live) {
         si->kernel_live = 1;
         CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     }
-    printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
-           si->prefix, spurs_ea, si->nspus);
+    printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u size=%u%s (real BE instance + kernel poll)\n",
+           si->prefix, spurs_ea, si->nspus, inst_size,
+           inst_size > SPURS_INST_SIZE ? " SPURS2" : "");
     return CELL_OK;
 }
 
@@ -484,7 +501,8 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
     (void)spuPriority; (void)ppuPriority; (void)exitIfNoWork;
     if (!spurs)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    return spurs_initialize_common((u32)(uintptr_t)spurs, (u32)nSpus, NULL);
+    return spurs_initialize_common((u32)(uintptr_t)spurs, (u32)nSpus, NULL,
+                                   SPURS_INST_SIZE);
 }
 
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
@@ -494,7 +512,78 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     u32 spurs_ea = (u32)(uintptr_t)spurs;
     attr = GUEST_PTR(attr, const CellSpursAttribute*);
-    return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
+    return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix,
+                                   SPURS_INST_SIZE);
+}
+
+/* cellSpursInitializeWithAttribute2(spurs, attr) -- the SPURS2 revision.
+ * Reference (cellSpurs.cpp, RPCS3): identical attribute, but _spurs::initialize
+ * is called with SAF_SECOND_VERSION and the instance is the 8 KB CellSpurs2.
+ * The only difference this HLE model has to reproduce is that size: the port's
+ * CellSpurs layout for the guest is the reference's, so wids 16..31 and their
+ * wklInfo2/wklF2/wklH2 tables (0x1000..0x1B00) only exist in the 8 KB object.
+ * Before Module 12 this NID was unanswered, so the instance was never
+ * initialised at all and every later call on it saw zeroed bookkeeping. */
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr)
+{
+    if (!spurs || !attr)
+        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    u32 spurs_ea = (u32)(uintptr_t)spurs;
+    attr = GUEST_PTR(attr, const CellSpursAttribute*);
+    return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix,
+                                   SPURS_INST_SIZE2);
+}
+
+/* cellSpursGetWorkloadFlag(spurs, flag) -- hand the caller the address of the
+ * instance's workload flag (reference: `*flag = &spurs->wklFlag`), which the
+ * PPU-side job-chain pump then waits on / signals. */
+s32 cellSpursGetWorkloadFlag(CellSpurs* spurs, u32* flag)
+{
+    if (!spurs || !flag)
+        return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+
+    u32 spurs_ea = (u32)(uintptr_t)spurs;
+    vm_write32((u32)(uintptr_t)flag, spurs_ea + SPURS_WKL_FLAG);
+    printf("[cellSpurs] GetWorkloadFlag(spurs=0x%08X) -> 0x%08X\n",
+           spurs_ea, spurs_ea + SPURS_WKL_FLAG);
+    return CELL_OK;
+}
+
+/* _cellSpursWorkloadFlagReceiver2(spurs, wid, is_set, print_debug_output) --
+ * claim (is_set != 0) or release (is_set == 0) the single receiver slot that
+ * the workload flag carries. Reference (cellSpurs.cpp, RPCS3): the slot is one
+ * byte, 0xFF when free; claiming an already-owned slot is BUSY, releasing a
+ * slot you do not own is PERM. Validated in the same order as the reference
+ * (wid bound, workload enabled, then the swap). */
+s32 _cellSpursWorkloadFlagReceiver2(CellSpurs* spurs, u32 wid,
+                                    u32 is_set, u32 printDebugOutput)
+{
+    (void)printDebugOutput;
+    if (!spurs || !vm_base)
+        return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+
+    u32 spurs_ea = (u32)(uintptr_t)spurs;
+    u32 max_wkl  = (vm_base[spurs_ea + SPURS_FLAGS1] & 0x40u)
+                   ? (u32)CELL_SPURS_MAX_WORKLOAD2 : (u32)CELL_SPURS_MAX_WORKLOAD;
+
+    if (wid >= max_wkl)
+        return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
+    if (!(vm_read32(spurs_ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid)))
+        return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
+
+    u8 recv = vm_base[spurs_ea + SPURS_WKL_RECEIVER];
+    if (is_set) {
+        if (recv != 0xFF) return CELL_SPURS_POLICY_MODULE_ERROR_BUSY;
+        recv = (u8)wid;
+    } else {
+        if (recv != (u8)wid) return CELL_SPURS_POLICY_MODULE_ERROR_PERM;
+        recv = 0xFF;
+    }
+    vm_base[spurs_ea + SPURS_WKL_RECEIVER] = recv;
+    printf("[cellSpurs] WorkloadFlagReceiver2(spurs=0x%08X wid=%u %s) -> ok\n",
+           spurs_ea, wid, is_set ? "claim" : "release");
+    return CELL_OK;
 }
 
 static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */

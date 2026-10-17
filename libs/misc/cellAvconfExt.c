@@ -7,6 +7,7 @@
 
 #include "cellAvconfExt.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
+#include "../video/cellVideoOut.h"          /* CELL_VIDEO_OUT_* (GetScreenSize) */
 
 /* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
  * bare deref here writes to whatever host address shares that number. These
@@ -18,6 +19,7 @@
 extern u8* vm_base;
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
+#include <stdlib.h>   /* getenv/atof (VideoOutGetScreenSize) */
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -182,6 +184,45 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
     (void)videoOut;
     printf("[cellAvconfExt] VideoOutSetGamma(%.2f)\n", gamma);
     s_gamma = gamma;
+    return CELL_OK;
+}
+
+/* cellVideoOutGetScreenSize(videoOut, screenSize) -- the physical screen
+ * diagonal in inches, which the stereo-3D calibration UI needs. Reference:
+ * cellAvconfExt.cpp (RPCS3) returns the configured size ONLY when stereo 3D is
+ * enabled, and CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET otherwise -- so a 2D boot
+ * (there and here) takes the error path and leaves the caller's float alone.
+ * PS3_STEREO_3D mirrors RPCS3's `stereo_enabled`; PS3_SCREEN_SIZE mirrors its
+ * `screen_size` config (default 24").
+ *
+ * Before Module 12 this import had no handler at all, so the unresolved-NID
+ * default answered CELL_OK while writing nothing: a caller that treats success
+ * as "screenSize is now valid" read whatever was in the float before.
+ *
+ * (Note the guest imports it from cellSysutilAvconfExt -- it lives in the
+ * AvconfExt HLE next to the other video-out extended queries.) */
+s32 cellVideoOutGetScreenSize(u32 videoOut, float* screenSize)
+{
+    if (!screenSize)
+        return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
+    if (videoOut != CELL_VIDEO_OUT_PRIMARY)
+        return CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;
+
+    { static int _stereo = -1;
+      if (_stereo < 0) _stereo = getenv("PS3_STEREO_3D") ? 1 : 0;
+      if (!_stereo) {
+          printf("[cellAvconfExt] VideoOutGetScreenSize(videoOut=%u) -> not set (2D)\n",
+                 videoOut);
+          return CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET;
+      } }
+
+    { float inches = 24.0f; uint32_t bits;
+      const char* e = getenv("PS3_SCREEN_SIZE");
+      if (e && *e) inches = (float)atof(e);
+      memcpy(&bits, &inches, 4);
+      vm_write32((uint32_t)(uintptr_t)screenSize, bits);
+      printf("[cellAvconfExt] VideoOutGetScreenSize(videoOut=%u) -> %.1f in (3D)\n",
+             videoOut, inches); }
     return CELL_OK;
 }
 

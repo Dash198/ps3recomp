@@ -671,7 +671,26 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             return;
         }
         static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
+        if (logged < 40) {
+            /* Attribute the miss. The bare NID says *that* an import went
+             * unanswered but not where from, and the arguments are the only
+             * record of what the title asked it to do -- with both, a miss can
+             * be traced to its guest call site statically (find the enclosing
+             * lifted function of lr / search the branch to the stub at cia)
+             * instead of needing another instrumented build. lr is the guest
+             * instruction after the import call; cia is where the trampoline
+             * was entered. This is the unresolved-path companion to the fault
+             * attribution of Module 7 (see ROADMAP M2). */
+            fprintf(stderr,
+                    "[hle] unresolved NID 0x%08X lr=0x%08X cia=0x%08X "
+                    "r3..r10=%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                    nid, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
+                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                    (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6],
+                    (uint32_t)ctx->gpr[7], (uint32_t)ctx->gpr[8],
+                    (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[10]);
+            logged++;
+        }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
