@@ -15,11 +15,12 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 7. [find_functions.py — Function Boundary Detection](#find_functionspy)
 8. [nid_database.py — NID Resolver](#nid_databasepy)
 9. [nid_from_strings.py — name an unknown NID from strings](#nid_from_stringspy)
-10. [import_dashboard.py — import coverage for one title](#import_dashboardpy)
-11. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
-12. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
-13. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
-14. [Dependencies](#dependencies)
+10. [nid_from_rpcs3_log.py — name an unknown NID from an emulator log](#nid_from_rpcs3_logpy)
+11. [import_dashboard.py — import coverage for one title](#import_dashboardpy)
+12. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
+13. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
+14. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
+15. [Dependencies](#dependencies)
 
 ---
 
@@ -527,9 +528,12 @@ SDK-linked tool, a debug build), hashes each, and looks the NID up in that gazet
 A hit is definitive, not a guess, and a NID whose candidates disagree is refused
 rather than resolved to one of them. No external `strings` dependency.
 
-Firmware PRXs cannot do this: a PS3 export table carries `(library, NID)` and no
-per-export names, so `PS3UPDAT.PUP` can confirm a library and nothing else. This is
-the fallback for when no symbol-bearing build (`tools/nid_harvest.py`'s input) exists.
+Firmware is a weak source, not a silent one: a PS3 export table carries the library
+name, a NID array and an address array, and no per-function names — but a decrypted
+module still writes some of its export names down as plain strings, which this tool
+finds (it names 29 of `fw_spu/libsre.prx`'s 269 exports). Firmware alone is therefore
+sparse rather than useless; `nid_from_rpcs3_log.py` is the stronger source when the
+title has been run under an emulator.
 
 ### Usage
 
@@ -546,6 +550,48 @@ python tools/nid_from_strings.py <binary> --imports EMAIN.imports.json \
 Candidate names still have to be added to `nid_database.py`'s curated list to be used
 at resolution time; `tools/test_nid_from_strings.py` pins that direction (`--lookup`
 finds the name) as well as the hash.
+
+---
+
+## nid_from_rpcs3_log.py
+
+**Purpose:** put a *name* to an unknown NID, given an emulator run's log.
+
+The same proof as `nid_from_strings.py` (`compute_nid(name) == NID`), but the candidates
+come from the strongest place available: RPCS3's loader prints the name *beside* the NID
+for every import and export of every module it loads.
+
+```
+ppu_loader: **** sys_fs import: [cellFsReadWithOffset] (0x0d5b4a14) -> 0x3b850
+ppu_loader: **** sysPrxForUser export: (0x04e83d2c) at 0x00d0708 [..]:  _sys_strncmp
+```
+
+When RPCS3 does not know a name it prints a placeholder instead — the bare NID, or
+`<library>_<NID>` like `sceNpBasicLimited_0xEB42E2E6`. Placeholders are counted and never
+resolved, and they are self-rejecting anyway: a placeholder is not the function's name,
+so it never hashes to the NID. A NID that two names claim is refused, not guessed.
+
+Running the title's log through it produced `tools/nid_from_rpcs3.json` (2563 verified
+NIDs across 97 libraries, loaded by `nid_database.py`), of which 220 named GT6 imports
+the curated list and the module logs had not (`README`-worthy: see G7 in `gt6/ROADMAP.md`).
+
+### Usage
+
+```bash
+# What is this NID, given this log?
+python tools/nid_from_rpcs3_log.py RPCS3.log --lookup 0x1F71ECBE
+#   0x1F71ECBE  cellKbGetConfiguration  [sys_io]
+
+# Name a whole import table; emit a file nid_database.py can load
+python tools/nid_from_rpcs3_log.py RPCS3.log --imports EMAIN.imports.json \
+       --only-unknown --out nid_from_rpcs3.json
+
+# Or dump the whole verified gazetteer from the log
+python tools/nid_from_rpcs3_log.py RPCS3.log --out nid_from_rpcs3.json
+```
+
+`tools/test_nid_from_rpcs3_log.py` covers the line parse, both placeholder shapes, the
+hash gate, ambiguity refusal, the CLI, and the committed gazetteer's hash invariant.
 
 ---
 

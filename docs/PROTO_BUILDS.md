@@ -44,10 +44,14 @@ python tools/dwarf_line.py EBOOT.elf 0x004F4A98
 Self-checks (no binary needed): `test_unfself.py`, `test_dwarf.py`, `test_nid_from_protos.py`.
 
 > **No prototype build for a title?** `nid_harvest.py` needs symbols, and firmware is
-> not a substitute — a PS3 PRX export table carries `(library, NID)` and no per-export
-> names. `tools/nid_from_strings.py` is the fallback: it harvests candidate names from
-> any binary's plain strings and verifies each with `compute_nid(name) == NID`. Same
-> proof, weaker coverage. See `docs/NID_SYSTEM.md`.
+> not a substitute — a PS3 PRX export-table *entry* carries the library name, a NID
+> array and an address array, never per-function names (a decrypted module still writes
+> some export names down as plain strings, but sparsely: 29 of `libsre.prx`'s 269).
+> `tools/nid_from_strings.py` is one fallback: it harvests candidate names from any
+> binary's plain strings and verifies each with `compute_nid(name) == NID`. The stronger
+> fallback, when the title has been run under an emulator, is
+> `tools/nid_from_rpcs3_log.py`, which reads the name the emulator prints beside every
+> import and export NID. Same proof, better coverage. See `docs/NID_SYSTEM.md`.
 
 ---
 

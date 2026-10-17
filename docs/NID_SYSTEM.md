@@ -343,27 +343,37 @@ The NID database is compiled from:
 2. **Sony SDK headers** — official function declarations with NID annotations
 3. **Community research** — reverse-engineered NIDs from homebrew and analysis tools
 4. **ps3recomp discoveries** — NIDs found during game analysis
-5. **Symbol tables and string data** — see below
+5. **Symbol tables, string data and emulator logs** — the two generated files
+   `nid_from_protos.json` (debug `.symtab`) and `nid_from_rpcs3.json` (an emulator's
+   loader log), every entry of which is proven by `compute_nid(name) == NID`; see
+   *Naming a NID the database does not have* below
 
 ### Naming a NID the database does not have
 
 A NID cannot be inverted. Naming one therefore means producing a *candidate* name and
 checking that it hashes back to the NID (`compute_nid(name) == NID`), which is a proof,
-not a guess. Two tools produce candidates from different places:
+not a guess. Three tools produce candidates from different places:
 
 | source of names | tool | needs |
 |---|---|---|
 | a build's `.symtab` | `tools/nid_harvest.py` → `nid_from_protos.json` | a symbol-bearing (prototype/debug) build — `docs/PROTO_BUILDS.md` |
 | a binary's plain strings | `tools/nid_from_strings.py` | any binary whose strings mention the API names |
+| an emulator's loader log | `tools/nid_from_rpcs3_log.py` → `nid_from_rpcs3.json` | one run of the title under RPCS3; its log prints the name beside the NID for every import and export |
 
-Firmware is **not** a name source: a PS3 PRX export table carries `(library, NID)`
-pairs and no per-export names, so `PS3UPDAT.PUP` can confirm which library a NID
-belongs to and nothing more. A candidate that collides with another (two names hashing
-to one NID) is refused rather than resolved to one of them.
+Firmware is a *weak* name source, not a silent one. A PS3 PRX export table entry carries
+the **library** name, a NID array and an address array — never per-function names
+(`elf_parser.PRXExportEntry.name_str` is the library, which is why `prx_exports.py` can
+build a resolver table but not a name table). Names nevertheless appear in a decrypted
+module as plain strings: `fw_spu/libsre.prx` (module `cellSre_Library`) contains 52
+name-shaped strings, which name 29 of its own 269 exports — `_cellSpursWorkloadFlagReceiver2`
+among them. So `nid_from_strings.py` over firmware works; it is simply sparse.
 
-Once verified, add the name to the curated list in `tools/nid_database.py` (the
-brute-force section keeps the NID in a trailing `# 0x…` comment) so it resolves for
-every port, and pin it in a test.
+A candidate that collides with another (two names hashing to one NID) is refused rather
+than resolved to one of them.
+
+Once verified, the name belongs in `tools/nid_database.py`'s curated list (the
+brute-force section keeps the NID in a trailing `# 0x…` comment) or in one of the two
+generated files, so it resolves for every port; pin it in a test either way.
 
 ---
 
