@@ -262,6 +262,8 @@ The preamble declares `g_trampoline_fn` as `extern "C" __declspec(thread)` to ma
 
 **Indirect calls (bctrl):** Emitted as `ps3_indirect_call(ctx)` which dispatches through a hash table mapping guest addresses to host function pointers. The game project must provide this function. It also handles OPD (Official Procedure Descriptor) resolution.
 
+**Guest `setjmp`/`longjmp`:** the SDK's statically linked libgcc context helpers (`__savegprlr_14` / `__restgprlr_14`) are recognised **by shape** (`discover_setjmp_helpers`), not by address — their addresses differ per title and toolchain. A `bl` to the save half *is* the guest's setjmp, so its call site is emitted as `PPU_SETJMP_GUARD(ctx, func_SAV)` (the host landing pad must live in the **caller's** frame, which is the one still live when the matching longjmp fires; the helper's own frame has already returned). The restore half ends in `blr` to the LR it reloaded — a non-local jump — so its body gets `ppu_lj_do(ctx, _sj_blk, _sj_sp)` immediately before that `return`. Lifted as two ordinary returning calls, the pair leaks a guest frame per round trip (GT6 walked `r1` out of the 3.5 GB VM arena that way). The runtime side is `ppu_sj_slot` / `ppu_lj_do` in `runtime/ppu/ppu_setjmp.inc`, included by `ppu_loader.cpp`. `tools/test_ppu_setjmp_helpers.py` pins the shape and both emissions; `tools/test_ppu_setjmp_exec.py` compiles them with the real runtime and runs a real `longjmp`.
+
 **TOC save:** The lifter does NOT emit `std r2, 40(r1)` before import stub calls (the PS3 linker normally inserts this). Game projects must save the TOC in their `nid_dispatch()` function.
 
 **VMX/AltiVec:** Vector instructions operate on `ctx->vr[N]` (128-bit registers). Vector loads/stores access guest memory via `vm_base + addr` with 16-byte alignment. Float operations treat each register as 4×float32.
@@ -275,6 +277,7 @@ The preamble declares `g_trampoline_fn` as `extern "C" __declspec(thread)` to ma
 | `lwz r3, 0x10(r4)` | `ctx->gpr[3] = vm_read32(ctx->gpr[4] + 0x10);` | Big-endian load |
 | `stw r3, 0x10(r4)` | `vm_write32(ctx->gpr[4] + 0x10, (uint32_t)ctx->gpr[3]);` | Big-endian store |
 | `bl 0x10200` | `func_00010200(ctx);` | Direct function call |
+| `bl <save helper>` | `PPU_SETJMP_GUARD(ctx, func_SAV);` | The guest's setjmp (shape-matched) |
 | `bctrl` | `ps3_indirect_call(ctx);` | Indirect call via hash table |
 | `blr` | `return;` | Function return |
 | `cmpwi cr0, r3, 0` | `{ int64_t a = ...; int64_t b = ...; cr_val = ...; }` | Inline CR update |
