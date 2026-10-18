@@ -398,23 +398,23 @@ not changed while a title runs.
 - **`LBP_HLE_JOBDONE`** — _(no description in source)_
   `runtime/spu/spu_channels.c:2466`
 - **`LBP_NO_TASKSET`** — null base and DMAs EVERYTHING from EA 0 (observed on LBP's FMOD mixer: 105k GETs from ea=0x0, degenerate handler targets -> branch-to-0, and the PPU pump blocks forever on EventFlag 0x0100). Planting it makes the mixer read the real FMOD control block (0x0094F5xx) and the EventFlag handshake completes. Default ON; LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
-  `runtime/spu/spu_workload.c:622`
+  `runtime/spu/spu_workload.c:623`
 - **`LBP_PERSIST_LS`** — _(no description in source)_
-  `runtime/spu/spu_workload.c:298`
+  `runtime/spu/spu_workload.c:299`
 - **`LBP_POLICY_CTX`** — EMPIRICAL TEST (LBP_POLICY_CTX): overlay the REAL policy's SpursTasksetContext onto binkspu's LS 0x2700, replacing the C reimpl, then let binkspu run with it. If the movie plane fills (not green) the policy's fuller ctx is the fix (H1); if still green, the frame-output gate is Bink-layer (H2). Keeps the build_context 0x100 kernel ctx (moduleId "TK") intact. */
-  `runtime/spu/spu_workload.c:708`
+  `runtime/spu/spu_workload.c:709`
 - **`LBP_REAL_POLICY`** — _(no description in source)_
-  `runtime/spu/spu_workload.c:676`
+  `runtime/spu/spu_workload.c:677`
 - **`LBP_SKIP_NULL_DMA`** — _(no description in source)_
   `runtime/spu/spu_dma.h:525`
 - **`LBP_SPU_SERIAL`** — _(no description in source)_
-  `runtime/spu/spu_workload.c:311`
+  `runtime/spu/spu_workload.c:312`
 - **`LBP_SYNC_ACK`** — ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE runs the task on a dedicated thread and re-runs the PM ~never, so the lanes froze and the skip path's min-of-lanes barrier (sub_4D3730) hung forever. A task ENTERING WAIT_SIGNAL has by definition drained all work dispatched to it, so advancing the active lanes to the published ticket here is semantically the PM's bookkeeping, batched. Validation gate. */
-  `runtime/spu/spu_workload.c:1067`
+  `runtime/spu/spu_workload.c:1080`
 - **`LBP_TASK_DELAY`** — _(no description in source)_
-  `runtime/spu/spu_workload.c:605`
+  `runtime/spu/spu_workload.c:606`
 - **`LBP_WS_DRAIN`** — one-shot SPU model the producer task ran to completion already, so the signal never arrives and the consumer blocks forever (movie/audio/loading deadlock). If set, after <secs> of no real signal we RETURN rc=0 as if the kernel resumed the task with "no pending work" -- lets it run its post-wait path (complete its loop / set completion flags) instead of hanging. 0/unset keeps the block-forever behaviour. Reversible, opt-in. */
-  `runtime/spu/spu_workload.c:1097`
+  `runtime/spu/spu_workload.c:1110`
 
 ## `LD`
 
@@ -1141,7 +1141,7 @@ not changed while a title runs.
 - **`SPU_DUMP_IMPORT`** — SPU_DUMP_IMPORT=<dir>: save each unique imported ELF (FMOD's runtime- materialized SPU overlay plugins) so they can be lifted + registered. Extent = max(p_off+p_fsz) over PT_LOADs, re-walked here cheaply. */
   `runtime/syscalls/lv2_register.c:1987`
 - **`SPU_DUMP_MISS`** — SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be lifted and registered. SPURS job binaries are raw code+data blobs the title loads from its own data files -- unlike sys_spu_image programs they are NOT embedded ELFs in the EBOOT, so tools/extract_spu_images.py cannot find them and this is the only place the bytes exist. One file per fingerprint. */
-  `runtime/spu/spu_workload.c:829`  _(+1 more sites)_
+  `runtime/spu/spu_workload.c:831`  _(+1 more sites)_
 - **`SPU_DUMP_OVL`** — _(no description in source)_
   `runtime/spu/spu_channels.c:1597`
 - **`SPU_DUMP_PM_MISS`** — Policy modules are raw SPU code+data blobs loaded by the game, not embedded SPU ELFs. Keep the dump opt-in and write each fingerprint once so a missing module can be lifted without changing normal logs. */
@@ -1187,7 +1187,7 @@ not changed while a title runs.
 - **`SPU_LSREAD_TRACE`** — _(no description in source)_
   `runtime/syscalls/lv2_register.c:1778`  _(+1 more sites)_
 - **`SPU_LS_DUMP`** — SPU_LS_DUMP=<prefix>: write this job's whole local store when it ends. A reference dump from real hardware is a full local store, so the only way to ask "what ELSE is different" -- rather than checking one guessed word at a time -- is to diff all 256 KB. */
-  `runtime/spu/spu_workload.c:763`
+  `runtime/spu/spu_workload.c:764`
 - **`SPU_LS_LOWREAD`** — _(no description in source)_
   `runtime/spu/spu_context.h:497`  _(+1 more sites)_
 - **`SPU_LS_WATCH`** — _(no description in source)_
@@ -1227,7 +1227,7 @@ not changed while a title runs.
 - **`SPU_SIGSTAT`** — _(no description in source)_
   `runtime/spu/spu_raw.c:409`
 - **`SPU_SIG_STATS`** — SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
-  `runtime/spu/spu_workload.c:1020`
+  `runtime/spu/spu_workload.c:1033`
 - **`SPU_SMC_HI`** — _(no description in source)_
   `runtime/spu/spu_dma.h:583`  _(+1 more sites)_
 - **`SPU_SMC_LO`** — _(no description in source)_
@@ -1508,11 +1508,11 @@ not changed while a title runs.
 - **`YDKJ_CRI_GATE1TRACE`** — YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80 (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F / 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the ACTUAL runtime result + inputs the first N times it returns. Fires on range-exit (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
   `runtime/spu/spu_interp.c:355`
 - **`YDKJ_CRI_RESUME`** — so it polls the (concurrently PPU-updated) eaContext, finds no work, yields and exits before the PPU marks work-ready. Approximate the resume by re-running the task (fresh context re-read from eaContext) in a bounded loop until it actually DECODES (a >256B video GET sets g_cri_video_dma) or we time out. This does NOT fake data: the task only decodes if the PPU genuinely populated real work meanwhile. */
-  `runtime/spu/spu_workload.c:727`
+  `runtime/spu/spu_workload.c:728`
 - **`YDKJ_CRI_TASKSET`** — (image 22) calls the SPURS task-API via a jump table at LS 0x2700 and reads its task descriptor at LS 0x2FB0 — both POLICY-provided, not in the task ELF (so it branch-to-0's at func_00026DE0). Preload the policy module (libsre @0x30021480 -> LS 0xA00) and write the task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then run the cri task, to see how much further it gets. Diagnostic only. */
-  `runtime/spu/spu_workload.c:474`
+  `runtime/spu/spu_workload.c:475`
 - **`YDKJ_CRI_WAKE`** — YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't propagated yet). Tests whether the game then advances to draw content. */
-  `runtime/spu/spu_workload.c:754`
+  `runtime/spu/spu_workload.c:755`
 - **`YDKJ_DMA_IMG`** — _(no description in source)_
   `runtime/spu/spu_dma.h:437`
 - **`YDKJ_E60`** — _(no description in source)_
@@ -1530,9 +1530,9 @@ not changed while a title runs.
 - **`YDKJ_FORCE_HLE`** — _(no description in source)_
   `runtime/ppu/ppu_hle.cpp:347`
 - **`YDKJ_G1_CTX`** — _(no description in source)_
-  `runtime/spu/spu_workload.c:559`
+  `runtime/spu/spu_workload.c:560`
 - **`YDKJ_G1_LSPAT`** — _(no description in source)_
-  `runtime/spu/spu_workload.c:557`
+  `runtime/spu/spu_workload.c:558`
 - **`YDKJ_GUARD_INST`** — Arm a page-guard on the instance page so we catch the libsre function that writes the CellSpurs struct (WWATCH misses memcpy/DMA writes). Its own lever, so it still arms with the dump off; it protects a page rather than reading one, and is a no-op away from Windows. */
   `runtime/syscalls/lv2_register.c:952`
 - **`YDKJ_GUESTINIT`** — YDKJ_GUESTINIT: the create-task (0x87630976) runs BEFORE the game's own init of its task descriptor (r3), so descriptor+0xC != 0xFF -> STAT. Eagerly invoke the REAL init (0x22AAB31D) on the descriptor first via the guest-caller (ppu_guest_call runs it in a scratch ctx, so the create's args survive). This does the FULL init incl. the task-slot alloc syscall -- unlike the raw +0xC force (FORCEATTR) that hung -- then create proceeds against a valid descriptor. */
@@ -1554,7 +1554,7 @@ not changed while a title runs.
 - **`YDKJ_MEMFIX`** — Override the mis-lifted optimized memmove with a correct native one. */
   `runtime/ppu/ppu_loader.cpp:2267`
 - **`YDKJ_MINIMAL_CTX`** — _(no description in source)_
-  `runtime/spu/spu_workload.c:522`
+  `runtime/spu/spu_workload.c:523`
 - **`YDKJ_NETOFFLINE`** — YDKJ_NETOFFLINE: unresolved network NIDs (sys_net/cellHttp/cellSysutil) default r3=0 (fake success) -> the game stores a NULL handle as an object and later virtual-calls it -> the 0xC708C708 null-vtable crash. Return a negative error instead so the game's online-content check takes its graceful OFFLINE-FAILURE path and proceeds with the local Persistent.zip. */
   `runtime/ppu/ppu_hle.cpp:733`
 - **`YDKJ_NOEXIT`** — YDKJ_NOEXIT (diagnostic): the title self-exits after ~2 frames on a teardown assert triggered by incomplete SPU/SPURS state (a timing race). Ignoring the exit on the calling thread lets the render loop keep running so we can see whether sustained execution produces on-screen content. */
@@ -1562,7 +1562,7 @@ not changed while a title runs.
 - **`YDKJ_NOHDLR`** — Diagnostic (YDKJ_NOHDLR): suppress libsre's SPURS handler threads (entry in the libsre image range) -- they assert that the SPU side isn't operational and crash. Skipping them lets the main thread (already past cellSpursInitialize) keep running, to see how far it gets. The thread is "created" (tid returned) but never spawned. */
   `runtime/syscalls/sys_ppu_thread.c:426`
 - **`YDKJ_NO_CRI_CTX`** — task ELF directly, so LS 0x2700 is empty and the task branch-to-0's: cri func_00026DE0 reads syscallAddr@0x27C4 (=0) and branches there. Plant a minimal context so the task-API call lands on the HLE syscall trampoline (LS 0xA70, intercepted in spu_channels.c) + the task descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158). Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
-  `runtime/spu/spu_workload.c:518`
+  `runtime/spu/spu_workload.c:519`
 - **`YDKJ_NO_CRI_R4`** — YDKJ_CRI_R4: the taskset policy entry (LS 0xA00, image 23) writes r4 into SpursTasksetContext.taskset @LS 0x27B8 (per RPCS3 cellSpursSpu.cpp). Our kernel->policy handoff doesn't convey the taskset EA, so the policy DMAs the taskset from garbage -> waiting!=0 -> wrong resume path -> savedContextLr=0. Inject r4 = taskset EA (0x0F000000) at the policy entry dispatch (this is the exact point before the entry reads r4, after the kernel's arg setup). */
   `runtime/spu/spu_channels.c:2126`  _(+1 more sites)_
 - **`YDKJ_NO_PORTROUTE`** — _(no description in source)_

@@ -44,7 +44,7 @@ for gen in "$HERE"/gen_test_*.py; do
     EXTRA=""
     [ -f "$HERE/test_${name}.deps" ] && . "$HERE/test_${name}.deps"
 
-    if "$GCC" -std=c11 -O2 -I "$gen_out" -I "$RUNTIME_SPU" \
+    if "$GCC" -std=c11 -O2 -I "$gen_out" -I "$RUNTIME_SPU" -I "$REPO/include" \
         "$gen_out/spu_recomp.c" "$main" $EXTRA -o "$exe" \
         2> "$HERE/build_${name}.log"; then
         out=$("$exe" 2>&1) && rc=$? || rc=$?

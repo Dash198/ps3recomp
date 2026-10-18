@@ -22,7 +22,8 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 14. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
 15. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
 16. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
-17. [Dependencies](#dependencies)
+17. [build_spu_jobs.py — lift and register raw SPU job binaries](#build_spu_jobspy--lift-and-register-raw-spu-job-binaries)
+18. [Dependencies](#dependencies)
 
 ---
 
@@ -869,6 +870,62 @@ dependencies. `tools/test_hle_answers.py` (59 checks) covers the end-to-end
 registration for the five imports that exposed it: NID identity from the name,
 the generated table actually naming each one, and the reference constants their
 bodies use.
+
+---
+
+
+## build_spu_jobs.py — lift and register raw SPU job binaries
+
+The other SPU lifter (`build_spu_workloads.py`) consumes **ELF** images. Some
+titles do not hand SPURS an ELF at all: they hand it a flat, position-independent
+code+data blob through `cellSpursRunJobChain`, and no file on disk contains those
+bytes — they only exist in the title's own data. The runtime's miss path is the
+only place they can be observed, so `spu_workload.c` writes them out under
+`SPU_DUMP_MISS`:
+
+```bash
+SPU_DUMP_MISS=gt6/spu/misses \
+  timeout -s KILL 25s env PS3_VFS_ROOT="$PWD/vfs" \
+  build/MyGameRecomp "$PWD/vfs/USRDIR/EMAIN.elf"
+# -> gt6/spu/misses/spujob_<FNV1a64 of the bytes>_<size>.bin, one per fingerprint
+```
+
+`build_spu_jobs.py` then wraps each dump, lifts it with `spu_lifter.py`
+(`--auto-functions --base 0`), and emits a registry keyed by the **same
+fingerprint the runtime computes**:
+
+```bash
+python tools/build_spu_jobs.py --jobs gt6/spu/misses --lifted gt6/spu \
+    --out gt6/spu/spu_jobs.c \
+    --register-fn gt6_spu_jobs_register_all --title gt6 --constructor
+```
+
+Layout it assumes, and why:
+
+- **Base 0.** `runtime/spu/spurs_job.c` stages the image at local store 0, so the
+  blob needs no relocation and every image can be lifted at address 0.
+- **The entry is read from the image, not assumed.** Each blob opens with 16 bytes
+  of `ila $r2` content signature and a stub at `0x10`–`0x2F` whose `br` at `0x1C`
+  names the entry (GT6: `0x30` for all 16; CRI's `jobelf`: `0x71D0`). `--entry`
+  overrides it; without a readable `br` the tool falls back to `0x30` and says so.
+- **Image ids from 40.** The runtime hard-codes 0–6 and 22/23, and Wwise jobmods
+  are registered at ≥200, so 40 upward is the free band.
+- **The fingerprint is FNV-1a-64 with the runtime's non-canonical basis**
+  (`1469598103934665603`, *not* `…6037`). This is the one detail that fails
+  silently if "fixed": the registry fills up, nothing matches, and the only
+  symptom is the `dispatch MISS` line that was already there.
+- **The name is cosmetic.** It comes from the module's own `name = <x>` text block
+  or its 16-byte `spu_name` field, and falls back to `unk`. Dispatching keys on
+  bytes, so a misread name is harmless.
+
+The tool hard-fails on a dump whose content does not hash to its own filename, and
+on a missing entry symbol — both mean the dumps and the lift disagree. The emitted
+`spu_jobs.c` self-registers from a constructor, and pairs with the port's
+`file(GLOB … */spu_recomp.c)` so a new job directory needs no CMake edit.
+
+`tools/test_build_spu_jobs.py` (251 checks, 11 mutations) pins the fingerprint
+constants against `spu_workload.c`, re-hashes every dump, and checks the emitted
+registry against the lift it points at.
 
 ---
 

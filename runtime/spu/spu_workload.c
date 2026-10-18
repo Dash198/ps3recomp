@@ -8,6 +8,7 @@
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
+#include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -810,8 +811,9 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     uint64_t fp = spu_workload_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
+    unsigned found = SPU_WORKLOAD_MAX;      /* registry slot, for the milestone */
     for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; found = i; break; }
     if (!fn) {
         /* Capped: an unlifted job a title dispatches every frame (Tornado
          * Outbreak's Wwise audio jobs) wrote 2 GB of these in three minutes,
@@ -846,6 +848,17 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
           } }
         return 0;
     }
+    /* First dispatch of each image is a boot milestone (the gate's only witness
+     * that the title's own job binaries are lifted and registered): a missing
+     * registration is otherwise invisible, since the chain gives up quietly and
+     * the milestone stream is unchanged. A title running its audio chain
+     * dispatches ~1500 jobs/s, so this is one array load on the hot path and
+     * the formatting happens at most once per registered image. */
+    { static unsigned char seen[SPU_WORKLOAD_MAX];
+      if (found < SPU_WORKLOAD_MAX && !seen[found]) {
+          seen[found] = 1;
+          ps3_msf("spu:job:0x%016llX", (unsigned long long)fp);
+      } }
     /* Two lines plus two explicit flushes PER JOB. A title running its audio
      * chain does ~1500 jobs/s, so this alone was ~6k writes/s through one FILE
      * lock, and it starved the guest threads competing for that lock badly
