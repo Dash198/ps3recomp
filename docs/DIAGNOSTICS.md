@@ -115,7 +115,7 @@ not changed while a title runs.
 ## `ALLOCPROBE`
 
 - **`ALLOCPROBE`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2512`  _(+1 more sites)_
+  `runtime/ppu/ppu_loader.cpp:2526`  _(+1 more sites)_
 
 ## `AUDIO`
 
@@ -236,7 +236,7 @@ not changed while a title runs.
 ## `FLOW`
 
 - **`FLOW_FORCE_RTCFG`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2798`
+  `runtime/ppu/ppu_loader.cpp:2812`
 - **`FLOW_FSDBG`** — _(no description in source)_
   `runtime/syscalls/sys_fs.c:501`
 - **`FLOW_LOCKOK`** — _(no description in source)_
@@ -244,7 +244,7 @@ not changed while a title runs.
 - **`FLOW_NOSPILL`** — import call leaves the caller with a garbage r2 -> all later TOC-relative loads (the C++ ctor list, globals, ...) read garbage -> boot corruption. */ FLOW_NOSPILL: with the lifted code using a constant main TOC (--main-toc/TOCFIX), the caller no longer reads [r1+0x28] to restore r2, so this ABI TOC-spill is unnecessary — and in the frameless-cascade it can clobber a caller frame slot (e.g. the deserializer's this-pointer). Skip it to test that theory. */
   `runtime/ppu/ppu_hle.cpp:332`
 - **`FLOW_PSSGTRACE`** — DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title's tty output carries a PhyreEngine init-failure fragment, dump the HOST backtrace (RVAs vs the exe base) so we can map the error-reporter's call chain through build_boot/flow.map and locate the failing function. */
-  `runtime/ppu/ppu_loader.cpp:3505`  _(+1 more sites)_
+  `runtime/ppu/ppu_loader.cpp:3555`  _(+1 more sites)_
 - **`FLOW_SPURSKERNEL`** — _(no description in source)_
   `runtime/ppu/ppu_hle.cpp:626`
 - **`FLOW_TITLEFIX`** — DIAGNOSTIC (FLOW_TITLEFIX): the game builds the title path with an EMPTY filename (a stale-lift string-construction bug) -> opens the dir. Redirect a bare ".../Data/Titles/" open to the language file so we can confirm the render path. */
@@ -592,29 +592,29 @@ not changed while a title runs.
 - **`PPU_CAS_FAIL`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1079`
 - **`PPU_CSCHECK`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2680`
+  `runtime/ppu/ppu_loader.cpp:2694`
 - **`PPU_FORCE_READ_ADDR`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1736`  _(+1 more sites)_
 - **`PPU_FORCE_READ_VAL`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1737`  _(+1 more sites)_
 - **`PPU_GUARD_EA`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3314`  _(+1 more sites)_
+  `runtime/ppu/ppu_loader.cpp:3364`  _(+1 more sites)_
 - **`PPU_HOTMAP`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1577`  _(+1 more sites)_
 - **`PPU_KEEP_EA`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3762`
+  `runtime/ppu/ppu_loader.cpp:3812`
 - **`PPU_NOOP_BAD_VCALL`** — Opt-in (PPU_NOOP_BAD_VCALL): also no-op MISALIGNED / out-of-code-range targets. A valid entry is 4-aligned in game .text (0x10000..0xFFFFFFF) or PRX (0x30000000..0x3FFFFFFF). This lets the boot proceed PAST bad vcalls (diagnostic band-aid — skipped methods leave state incomplete). Default OFF so the boot takes a clean crash-with-backtrace instead. */
-  `runtime/ppu/ppu_loader.cpp:3059`
+  `runtime/ppu/ppu_loader.cpp:3109`
 - **`PPU_OPD_RECOVER`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2899`
+  `runtime/ppu/ppu_loader.cpp:2913`
 - **`PPU_POKE`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3741`
+  `runtime/ppu/ppu_loader.cpp:3791`
 - **`PPU_POKE8`** — otherwise unanswerable without implementing a whole subsystem -- "if this flag did become what the title is waiting for, would it go anywhere?" -- and the answer decides whether the subsystem is worth building. */ PPU_POKE8=<hex ea>:<hex byte>[,...] -- the byte-wide form. A flag a title gates behaviour on is often one byte inside a struct, and a 32-bit poke would trample its neighbours. */
-  `runtime/ppu/ppu_loader.cpp:3714`
+  `runtime/ppu/ppu_loader.cpp:3764`
 - **`PPU_POKE_ADDR`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:823`
 - **`PPU_POKE_AFTER_MS`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3731`
+  `runtime/ppu/ppu_loader.cpp:3781`
 - **`PPU_POKE_MS`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:808`
 - **`PPU_POKE_VAL`** — _(no description in source)_
@@ -624,7 +624,7 @@ not changed while a title runs.
 - **`PPU_RESV_STORE`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:922`
 - **`PPU_RETWATCH`** — PPU_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3) equals this, pinning the exact virtual method that produces the poison. */
-  `runtime/ppu/ppu_loader.cpp:3022`
+  `runtime/ppu/ppu_loader.cpp:3072`
 - **`PPU_RVAL`** — PPU_RVAL=<hex>: catch where a value is READ FROM memory (its source loc) — the complement to PPU_WVAL, to find the origin of the 0xC708C708 poison. */
   `runtime/ppu/ppu_loader.cpp:1827`
 - **`PPU_RVAL64`** — _(no description in source)_
@@ -642,33 +642,33 @@ not changed while a title runs.
 - **`PPU_SPINBT`** — PPU_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin is on the watched address -- names the guest function containing the spin loop + its callers (resolve RVAs against the linker map). Same mechanism as the read64 variant below; LBP's GPU-ref wait (0x03002008) is a read32 spin. */
   `runtime/ppu/ppu_loader.cpp:1877`  _(+1 more sites)_
 - **`PPU_STUCKMAX`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3080`
+  `runtime/ppu/ppu_loader.cpp:3130`
 - **`PPU_THREADARG`** — _(no description in source)_
   `runtime/syscalls/sys_ppu_thread.c:414`
 - **`PPU_THREADGATE`** — _(no description in source)_
   `runtime/syscalls/sys_ppu_thread.c:439`
 - **`PPU_TOCFIX`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3009`
+  `runtime/ppu/ppu_loader.cpp:3059`
 - **`PPU_TOCWATCH`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2723`
+  `runtime/ppu/ppu_loader.cpp:2737`
 - **`PPU_VCALL_BT`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3065`
+  `runtime/ppu/ppu_loader.cpp:3115`
 - **`PPU_WVAL`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:1958`
-- **`PPU_WVAL_GATE`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1972`
+- **`PPU_WVAL_GATE`** — _(no description in source)_
+  `runtime/ppu/ppu_loader.cpp:1986`
 - **`PPU_WVAL_HI`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:1967`
+  `runtime/ppu/ppu_loader.cpp:1981`
 - **`PPU_WVAL_LO`** — PPU_WVAL_LO/HI: restrict to a destination range. A distinctive value is usually also a common constant -- 100.0f lands in .data dozens of times before it ever reaches the heap -- so without this the interesting hit is past the print cap before it happens. */
-  `runtime/ppu/ppu_loader.cpp:1966`
+  `runtime/ppu/ppu_loader.cpp:1980`
 - **`PPU_WWATCH`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:1990`
+  `runtime/ppu/ppu_loader.cpp:2004`
 - **`PPU_WWATCH_LEN`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1943`  _(+1 more sites)_
 - **`PPU_WWATCH_MAX`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2033`
+  `runtime/ppu/ppu_loader.cpp:2047`
 - **`PPU_WW_GUARD`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2014`
+  `runtime/ppu/ppu_loader.cpp:2028`
 
 ## `PS1`
 
@@ -698,23 +698,23 @@ not changed while a title runs.
 ## `PS3`
 
 - **`PS3_ALLOCTAG`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2119`  _(+1 more sites)_
+  `runtime/ppu/ppu_loader.cpp:2133`  _(+1 more sites)_
 - **`PS3_ARGV`** — emulator takes NINE, and argv[5] is the only place it learns which game to load -- with one argument it boots, believes it is emulating, and renders nothing. The layout is what lv2 does (64-bit big-endian pointer slots, NULL-terminated, then a NULL envp, strings 16-byte aligned after the slots), verified against RPCS3 ppu_load_exe. For a single argument it is byte-identical to what this produced before, so no port moves. */
-  `runtime/ppu/ppu_loader.cpp:4077`
+  `runtime/ppu/ppu_loader.cpp:4127`
 - **`PS3_BOOT_PATH`** — argv[0] MUST match the real disc path — the game's boot sequencer (func @~0x61e00) strncmp's argv[0] against "/dev_bdvd" and branches (disc vs hdd). RPCS3 oracle: real argv[0]=/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN. The old /dev_hdd0/NPUA80001 (another game's id) failed the compare -> wrong boot branch -> init divergence/deadlock. $PS3_BOOT_PATH overrides. */
-  `runtime/ppu/ppu_loader.cpp:4064`
+  `runtime/ppu/ppu_loader.cpp:4114`
 - **`PS3_BREADCRUMB`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2720`  _(+1 more sites)_
+  `runtime/ppu/ppu_loader.cpp:2734`  _(+1 more sites)_
 - **`PS3_CALLTRACE`** — PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) -- generic visibility into vtable/callback dispatch (e.g. which job body a JobManager worker runs). */
-  `runtime/ppu/ppu_loader.cpp:2734`
+  `runtime/ppu/ppu_loader.cpp:2748`
 - **`PS3_CALLTRACE_FROM`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2755`
+  `runtime/ppu/ppu_loader.cpp:2769`
 - **`PS3_CALLTRACE_LR`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2739`
+  `runtime/ppu/ppu_loader.cpp:2753`
 - **`PS3_CALLTRACE_R5`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2764`
+  `runtime/ppu/ppu_loader.cpp:2778`
 - **`PS3_CALLTRACE_TO`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2751`
+  `runtime/ppu/ppu_loader.cpp:2765`
 - **`PS3_CAMERA`** — _(no description in source)_
   `libs/hardware/cellCamera.c:58`
 - **`PS3_COND_PEEK`** — Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
@@ -784,9 +784,9 @@ not changed while a title runs.
 - **`PS3_HLE_UNRESOLVED`** — _(no description in source)_
   `runtime/ppu/ppu_hle.cpp:168`
 - **`PS3_ICALL_GATE`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2631`  _(+1 more sites)_
+  `runtime/ppu/ppu_loader.cpp:2645`  _(+1 more sites)_
 - **`PS3_ICALL_TRACE`** — PS3_ICALL_TRACE=<tid>: also log every call on that guest thread, in order. */
-  `runtime/ppu/ppu_loader.cpp:2661`
+  `runtime/ppu/ppu_loader.cpp:2675`
 - **`PS3_LWMUTEX_TRACE`** — PS3_LWMUTEX_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader. Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a contended block it logs who holds it and for how long; on unlock it flags a long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the convoy root. Default OFF. */
   `runtime/ppu/ppu_sysprx.cpp:162`
 - **`PS3_MAIN_STACK_LV2`** — _(no description in source)_
@@ -810,7 +810,7 @@ not changed while a title runs.
 - **`PS3_NO_THREAD_EXIT_UNWIND`** — _(no description in source)_
   `runtime/syscalls/sys_ppu_thread.c:542`
 - **`PS3_NULL_CALL`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2849`
+  `runtime/ppu/ppu_loader.cpp:2863`
 - **`PS3_NULL_READ`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1708`
 - **`PS3_NULL_SWEEP`** — _(no description in source)_
@@ -822,7 +822,7 @@ not changed while a title runs.
 - **`PS3_POLLTOP`** — _(no description in source)_
   `runtime/syscalls/sys_timer.c:128`
 - **`PS3_PRX_CALLTRACE`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:2959`
+  `runtime/ppu/ppu_loader.cpp:3009`
 - **`PS3_RIF_KEY`** — _(no description in source)_
   `libs/filesystem/edat.c:404`
 - **`PS3_SAMPLE`** — _(no description in source)_
@@ -832,15 +832,15 @@ not changed while a title runs.
 - **`PS3_SAVEDATA_ARG9_OFF`** — _(no description in source)_
   `libs/system/cellSaveData.c:1450`
 - **`PS3_SCBLOCK_PROF`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3556`
+  `runtime/ppu/ppu_loader.cpp:3606`
 - **`PS3_SCENTER`** — PS3_SCENTER=1: log the syscall BEFORE dispatching it. sc_trace runs after the call returns, so a syscall that never returns leaves no trace at all -- which is exactly the case being chased here: the main guest thread runs ~42,000 R3000 instructions in 30 ms, then parks in ntdll forever with no further [sc] line. The last ENTER without a matching exit names the call that blocked. */
-  `runtime/ppu/ppu_loader.cpp:3549`
+  `runtime/ppu/ppu_loader.cpp:3599`
 - **`PS3_SCREEN_SIZE`** — _(no description in source)_
   `libs/misc/cellAvconfExt.c:220`
 - **`PS3_SCTRACE`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:379`
 - **`PS3_SCTRACE_TID`** — PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread (tid=1) so we can see what it does AFTER receiving its q=1 event and why it never registers handlers / loads assets. */
-  `runtime/ppu/ppu_loader.cpp:3340`
+  `runtime/ppu/ppu_loader.cpp:3390`
 - **`PS3_SDK_VERSION`** — _(no description in source)_
   `runtime/syscalls/lv2_register.c:2216`
 - **`PS3_SEMTRACE`** — _(no description in source)_
@@ -885,7 +885,7 @@ not changed while a title runs.
 ## `PT`
 
 - **`PT`** — PT detector: does this byte-write turn its word into the hunted truncated value? */
-  `runtime/ppu/ppu_loader.cpp:2077`
+  `runtime/ppu/ppu_loader.cpp:2091`
 
 ## `RD`
 
@@ -1417,9 +1417,9 @@ not changed while a title runs.
 ## `TTY`
 
 - **`TTY_BT`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3472`  _(+1 more sites)_
+  `runtime/ppu/ppu_loader.cpp:3522`  _(+1 more sites)_
 - **`TTY_NO_DEDUPE`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:3437`
+  `runtime/ppu/ppu_loader.cpp:3487`
 
 ## `VBFULL`
 
@@ -1552,7 +1552,7 @@ not changed while a title runs.
 - **`YDKJ_KEEPGROUP`** — EXPERIMENT (YDKJ_KEEPGROUP): libsre rolls back the SPURS kernel group during cellSpursInitialize (the handler asserts the SPU side is dead). Skip the destroy so the group + threads survive, to see whether libsre then proceeds (group_start) or just re-asserts. Logs the caller for diagnosis. */
   `runtime/syscalls/lv2_register.c:1270`
 - **`YDKJ_MEMFIX`** — Override the mis-lifted optimized memmove with a correct native one. */
-  `runtime/ppu/ppu_loader.cpp:2267`
+  `runtime/ppu/ppu_loader.cpp:2281`
 - **`YDKJ_MINIMAL_CTX`** — _(no description in source)_
   `runtime/spu/spu_workload.c:523`
 - **`YDKJ_NETOFFLINE`** — YDKJ_NETOFFLINE: unresolved network NIDs (sys_net/cellHttp/cellSysutil) default r3=0 (fake success) -> the game stores a NULL handle as an object and later virtual-calls it -> the 0xC708C708 null-vtable crash. Return a negative error instead so the game's online-content check takes its graceful OFFLINE-FAILURE path and proceeds with the local Persistent.zip. */

@@ -1945,6 +1945,20 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
+/* Parse a watch knob documented as <hex> that has always gone through base 0.
+ * Under base 0 a bare hex literal is read as 0: "FEFF8D0" stops at the 'F' and
+ * arms the watch on address 0, which then reports "nothing writes this" for an
+ * address that is written constantly -- the same silent trap PPU_WWATCH
+ * documents. Keep base 0 so decimal callers are untouched, and retry base 16
+ * only when the base-0 parse stopped before the end of the string. */
+static uint32_t parse_hexish(const char* e)
+{
+    char* end = NULL;
+    unsigned long v = strtoul(e, &end, 0);
+    if (end && *end) v = strtoul(e, &end, 16);
+    return (uint32_t)v;
+}
+
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
@@ -1956,7 +1970,7 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
      * one instead. */
     { static uint32_t s_wv = 0xFFFFFFFFu, s_wvlo, s_wvhi;
       if (s_wv == 0xFFFFFFFFu) { const char* e = getenv("PPU_WVAL");
-                                 s_wv = e ? (uint32_t)strtoul(e, 0, 0) : 0;
+                                 s_wv = e ? parse_hexish(e) : 0;
                                  /* PPU_WVAL_LO/HI: restrict to a destination
                                   * range. A distinctive value is usually also a
                                   * common constant -- 100.0f lands in .data
@@ -1965,8 +1979,8 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                                   * is past the print cap before it happens. */
                                  const char* lo = getenv("PPU_WVAL_LO");
                                  const char* hi = getenv("PPU_WVAL_HI");
-                                 s_wvlo = lo ? (uint32_t)strtoul(lo, 0, 0) : 0;
-                                 s_wvhi = hi ? (uint32_t)strtoul(hi, 0, 0) : 0xFFFFFFFFu; }
+                                 s_wvlo = lo ? parse_hexish(lo) : 0;
+                                 s_wvhi = hi ? parse_hexish(hi) : 0xFFFFFFFFu; }
       /* PPU_WVAL_GATE=<file>: only while <file> exists (checked on matches). */
       static const char* s_wvg = (const char*)-1;
       if (s_wvg == (const char*)-1) s_wvg = getenv("PPU_WVAL_GATE");
@@ -2912,31 +2926,76 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
         /* Returning silently leaves r3 HOLDING THE FIRST ARGUMENT, so the guest
          * reads its own input back as the return value and reports a nonsense
          * error code. Tokyo Jungle: cellAudioSetNotifyEventQueue(key=0x23A0)
-         * "failed" with status 0x23A0 -- the key itself. Say so."*/
-        static int n = 0;
-        if (n++ < 400)
-        {
-            /* The lifted import thunk leaves the OPD address it loaded in r12,
-             * so we can tell a zero SLOT from a zeroed OPD -- i.e. whether the
-             * import was never resolved or was resolved and later clobbered.
+         * "failed" with status 0x23A0 -- the key itself. Say so.
+         *
+         * Report each (call site, r3) once and then only at 10x/100x/1000x.
+         * A repeated null call is the same fact, not new evidence: one GT6 run
+         * printed the same site 400 times (the old flat print cap saturated),
+         * which buried every other line in the log. The occurrence count is
+         * printed so the magnitude is still visible. */
+        { enum { NC_SITE = 24 };
+          static void*    s_ra[NC_SITE];
+          static uint32_t s_r3[NC_SITE];
+          static unsigned s_n[NC_SITE];
+          static int      s_k = 0;
+          static int      s_overflow = 0;
+          int slot = -1;
+          for (int i = 0; i < s_k; i++)
+              if (s_ra[i] == ra && s_r3[i] == (uint32_t)ctx->gpr[3]) { slot = i; break; }
+          if (slot < 0 && s_k < NC_SITE) {
+              slot = s_k++;
+              s_ra[slot] = ra;
+              s_r3[slot] = (uint32_t)ctx->gpr[3];
+              s_n[slot]  = 0;
+          }
+          if (slot < 0 && !s_overflow) {
+              /* Never drop a site silently -- that is the failure mode this
+               * whole reporter exists to avoid. */
+              s_overflow = 1;
+              fprintf(stderr, "[ppu] bctr to NULL: %d distinct sites seen; "
+                      "further sites are not reported (raise NC_SITE)\n", NC_SITE);
+          }
+          if (slot >= 0) {
+            unsigned seen = ++s_n[slot];
+            if (seen == 1 || seen == 10 || seen == 100 || seen == 1000)
+            {
+            /* r12 is an OPD ONLY for the lifted import thunks. A C++ vtable
+             * bctrl loads ctr from the OPD directly and never writes r12, so
+             * r12 is then stale from an unrelated call: GT6's value changed
+             * between runs (0x28000024 vs 0x24000084) while the real chain was
+             * r11=vtable / r9=OPD. Printing "r12(opd)=... opd[0]=0" for that
+             * invented a fault in address 0 that never happened, so r12 is now
+             * a bare register and is decoded as an OPD only when opd[0] is a
+             * plausible guest code address (the zero-slot vs zeroed-OPD test
+             * the old message existed for).
+             *
              * The return address here is the lifted body that did the bctrl, so
              * it names the caller exactly; the guest chain (G4) adds its own
              * callers. */
             char where[288];
             ppu_fault_where(where, sizeof where, ra);
-            uint32_t opd = (uint32_t)ctx->gpr[12];
-            uint32_t o0 = (opd && vm_base) ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+opd)) : 0;
-            fprintf(stderr, "[ppu] bctr to NULL r12(opd)=0x%08X opd[0]=0x%08X "
-                    "(r3=0x%08X r4=0x%08X "
-                    "tid=%llu) -- returning with r3 untouched\n"
-                    "      where: %s\n", opd, o0,
+            uint32_t r12 = (uint32_t)ctx->gpr[12];
+            uint32_t o0  = (r12 && vm_base)
+                           ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+r12)) : 0;
+            int is_opd   = (o0 >= 0x10000u && o0 < 0x10000000u && (o0 & 3) == 0);
+            fprintf(stderr, "[ppu] bctr to NULL ctr=0 r3=0x%08X r4=0x%08X "
+                    "r9=0x%08X r11=0x%08X r12=0x%08X%s tid=%llu"
+                    " -- returning with r3 untouched (x%u at this site/object)\n"
+                    "      where: %s\n",
                     (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
-                    (unsigned long long)ctx->thread_id, where);
+                    (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[11], r12,
+                    is_opd ? " (OPD)" : "",
+                    (unsigned long long)ctx->thread_id, seen, where);
+            if (is_opd)
+                fprintf(stderr, "      r12-opd[0]=0x%08X "
+                        "(zero slot vs zeroed OPD)\n", o0);
             if (ppu_guest_bt_on() && g_active_ctx) {
                 ppu_dump_guest_stack(g_active_ctx, "bctr-null");
                 ppu_pc_ring_dump("bctr-null");
             }
-        }
+          }   /* seen is a power of ten */
+          } /* slot >= 0 */
+        }   /* NC_SITE block */
         return;
         }
     }
