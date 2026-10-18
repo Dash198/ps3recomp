@@ -374,6 +374,16 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
+#else
+    /* Non-Windows sys_lwmutex is an owner stamp rather than a real lock, so
+     * there is nothing to release here; yield for the same 1 ms the Windows
+     * path spends instead of returning instantly. A bare return turns every
+     * guest condvar wait into a full-core spin: GT6's two soc workers call
+     * func_00A5F3DC -> sys_lwcond_wait in a loop and read the predicate byte
+     * ~300k times/s ([HOTREAD8] on 0x0169B199/0x0169B279). Guest signals are
+     * predicate-driven, so a timed yield cannot lose a wakeup. */
+    (void)lwmutex;
+    usleep(1000);
 #endif
     ctx->gpr[3] = 0;
 }

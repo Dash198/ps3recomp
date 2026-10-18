@@ -2269,6 +2269,8 @@ static struct {
     u16 max_grab;
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
+    volatile long alive;     /* 1 while the walker THREAD exists          */
+    volatile long stop;      /* Shutdown asked the current walker to quit */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -2582,13 +2584,22 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
 
 /* Wait for a guard to be released. Returns 1 if it opened, 0 on timeout (the
  * chain then gives up this pass rather than spinning the walker thread
- * forever). An unknown guard opens immediately -- a chain guarded by something
- * we never saw initialised must not deadlock the walker. */
-static int jg_wait(u32 ea)
+ * forever) and 2 if the owning chain was shut down while we waited. An unknown
+ * guard opens immediately -- a chain guarded by something we never saw
+ * initialised must not deadlock the walker.
+ *
+ * The shutdown check is not optional. GT6 creates/runs/shuts down/joins its
+ * "soc-job" chain six times at boot; each shutdown left the previous walker
+ * parked here, so six threads sat for the full 20 s and then each printed
+ * "chain gives up". The guest had long since moved on, and a walker that woke
+ * late could run a job against a descriptor the title had recycled. */
+static int jg_wait(u32 ea, int slot)
 {
+    if (slot >= 0 && s_jobchains[slot].stop) return 2;
     int i = jg_find(ea);
     if (i < 0) return 1;
     for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
+        if (slot >= 0 && s_jobchains[slot].stop) return 2;
         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
             /* Consume exactly one release worth of credits, so notifies that
              * arrived during the previous lap still count. */
@@ -2682,7 +2693,7 @@ static void jc_signal_done(u32 jc_ea)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, int slot)
 {
     u32 pc = entry_ea, ret_pc = 0;
     int jobs = 0;
@@ -2696,6 +2707,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
     int idle = 0;
     for (;; idle++) {
         if (idle > 4096) break;
+        if (slot >= 0 && s_jobchains[slot].stop) return;   /* Shutdown: quit now */
         u64 cmd = vm_read64(pc);
         u32 op  = (u32)(cmd & 7);
         u32 ext = (u32)(cmd & 127);
@@ -2732,7 +2744,8 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
             u32 g_ea = (u32)(cmd & ~127ull);
-            if (!jg_wait(g_ea)) return;                  /* still closed */
+            int wr = jg_wait(g_ea, slot);
+            if (wr != 1) return;                         /* closed or stopped */
             pc += 8; continue;
         }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
@@ -2755,11 +2768,18 @@ static DWORD WINAPI jc_thread(LPVOID p)
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
+               s_jobchains[slot].size_desc, slot);
     s_jobchains[slot].running = 0;
-    /* Tell the application the chain is done. Without this the walk finishes
-     * in silence and a thread waiting on the attached queue never runs again. */
-    jc_signal_done(s_jobchains[slot].jc_ea);
+    /* A shut-down chain must not post a completion: the title has already
+     * joined it and may have recycled the descriptor. Only a walk that ended
+     * on its own means "the work is done". */
+    if (!s_jobchains[slot].stop) {
+        /* Tell the application the chain is done. Without this the walk
+         * finishes in silence and a thread waiting on the attached queue
+         * never runs again. */
+        jc_signal_done(s_jobchains[slot].jc_ea);
+    }
+    s_jobchains[slot].alive = 0;      /* Join may now return */
     return 0;
 }
 
@@ -2790,12 +2810,30 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
-        /* Coalesce: a chain already being walked must not start twice. */
-        if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
-            HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
-            if (th) CloseHandle(th);
-            else s_jobchains[i].running = 0;
+        /* Coalesce: a chain already being walked must not start twice. The
+         * guard is `alive`, not `running`: Shutdown clears `running` to stop
+         * future walks, but the old thread can still be in jg_wait for a few
+         * milliseconds. Starting a second walker on the same chain/guard there
+         * would let two threads consume one notify and run one job twice. */
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (_InterlockedCompareExchange(&s_jobchains[i].alive, 1, 0) == 0) {
+                s_jobchains[i].stop    = 0;
+                s_jobchains[i].running = 1;
+                HANDLE th = CreateThread(NULL, 1u << 20, jc_thread,
+                                         (LPVOID)(intptr_t)i, 0, NULL);
+                if (th) CloseHandle(th);
+                else { s_jobchains[i].running = 0; s_jobchains[i].alive = 0; }
+                return CELL_OK;
+            }
+            if (!s_jobchains[i].stop) return CELL_OK;   /* already walking */
+#ifdef _WIN32
+            Sleep(1);                                   /* waiting for shutdown to land */
+#else
+            usleep(1000);
+#endif
         }
+        printf("[cellSpurs] %s(jc=0x%08X): previous walker still stopping; not starting a second\n",
+               who, (u32)jc_ea);
         return CELL_OK;
     }
     printf("[cellSpurs] %s(jc=0x%08X) -- UNKNOWN chain (no Create seen)\n", who, (u32)jc_ea);
@@ -2826,7 +2864,11 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
     if (_n++ < 8) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
-            s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
+            /* Set stop BEFORE clearing running: the walker polls stop and
+             * leaves jg_wait within 1 ms instead of sitting out the 20 s guard
+             * timeout. Join below waits for the thread to actually exit. */
+            s_jobchains[i].stop = 1;
+            s_jobchains[i].running = 0;
             return CELL_OK;
         }
     }
@@ -2849,7 +2891,10 @@ s32 cellSpursJoinJobChain(u64 jc_ea)
      * so that frame's data was never written at all. */
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
-        while (s_jobchains[i].running) {
+        /* `running` is cleared by Shutdown, so waiting on it let Join return
+         * while the walker was still parked in a guard wait. Wait for the
+         * THREAD to exit; Shutdown set stop, so that is milliseconds. */
+        while (s_jobchains[i].alive) {
 #ifdef _WIN32
             Sleep(0);
 #else
