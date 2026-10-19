@@ -43,6 +43,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
  * excludes the multimedia timer API, so it is asked for by name -- and after
@@ -294,9 +298,38 @@ static bool alloc_guest_vm(void)
     /* No vectored exception handlers off Windows, so the arena is committed up
      * front and lazily backed by the OS: only pages the title touches cost
      * anything. It stops below the 0xE0000000 mark, so ppu_vm_size arms the
-     * loader's bounds check for what is left. */
-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
-    ppu_vm_size = 0xE0000000u;
+     * loader's bounds check for what is left.
+     *
+     * The base must be 4 GB aligned, for two independent reasons:
+     *
+     *   - HLE code recovers a guest address from a host pointer by truncating
+     *     it to 32 bits (GUEST_EA). That invariant requires the low 32 bits of
+     *     vm_base to be zero.
+     *   - vm_commit/vm_protect operate on guest sub-ranges with mprotect,
+     *     which requires the HOST address to be page-aligned. calloc returns
+     *     a 16-byte-aligned pointer 0x10 into the mapping, so every
+     *     vm_protect on the arena failed EINVAL and PPU stack guard pages
+     *     were not actually armed.
+     *
+     * Over-map by 4 GB and trim to a 4 GB boundary, the same technique as
+     * vm_init() in runtime/memory/vm.h. */
+    const size_t want = 0xE0000000u;
+    uint8_t* raw = (uint8_t*)mmap(NULL, want + 0x100000000ull,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                                  -1, 0);
+    if (raw == MAP_FAILED)
+        return false;
+    uint8_t* aligned = (uint8_t*)(((uintptr_t)raw + 0xFFFFFFFFull)
+                                  & ~(uintptr_t)0xFFFFFFFFull);
+    if (aligned > raw)
+        munmap(raw, (size_t)(aligned - raw));
+    if ((uintptr_t)raw + want + 0x100000000ull > (uintptr_t)aligned + want)
+        munmap(aligned + want,
+               (size_t)(((uintptr_t)raw + want + 0x100000000ull)
+                        - ((uintptr_t)aligned + want)));
+    vm_base = aligned;
+    ppu_vm_size = (uint32_t)want;
 #endif
     return vm_base != nullptr;
 }

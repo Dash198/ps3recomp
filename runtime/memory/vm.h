@@ -118,6 +118,15 @@ static inline uint32_t vm_host_page_size(void)
  * -----------------------------------------------------------------------*/
 extern uint8_t* vm_base;
 
+/* Non-readable guest ranges, for diagnostics that walk guest memory (the
+ * stack dumper). vm_protect() records PROT_NONE ranges and vm_commit() clears
+ * them. A diagnostic that uses a raw memcpy must ask this first: bounds
+ * checking says an address is inside the arena, not that it is readable --
+ * PPU stack guard pages are inside the arena on purpose. */
+void vm_guard_note(uint32_t addr, uint32_t size, int readable);
+int  vm_guest_range_readable(uint32_t addr, uint32_t size);
+void vm_guard_reset(void);
+
 #ifndef _WIN32
 /* mprotect over the host pages covering [addr, addr+size). */
 static inline int vm__mprotect_pages(uint32_t addr, uint32_t size, int prot)
@@ -163,6 +172,7 @@ static inline void vm_shutdown(void);
 static inline int32_t vm_init(void)
 {
     if (vm_base != NULL) return CELL_OK; /* already initialized */
+    vm_guard_reset();
 
 #ifdef _WIN32
     /*
@@ -270,6 +280,7 @@ static inline void vm_shutdown(void)
 #endif
 
     vm_base = NULL;
+    vm_guard_reset();
 }
 
 /* ---------------------------------------------------------------------------
@@ -289,6 +300,7 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
         return CELL_ENOMEM;
 #endif
 
+    vm_guard_note(addr, size, 1);
     return CELL_OK;
 }
 
@@ -318,6 +330,9 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
         return CELL_EFAULT;
 #endif
 
+    /* Track only the ranges a diagnostic must not read. Write-only is not a
+     * useful mode here; treat any no-read protection as a guard. */
+    vm_guard_note(addr, size, read ? 1 : 0);
     return CELL_OK;
 }
 

@@ -1031,6 +1031,189 @@ s32 _sys_heap_free(sys_heap_t heap, void* ptr)
 }
 
 /* ---------------------------------------------------------------------------
+ * Fixed-block memory pools
+ *
+ * The pool does not own the storage: the guest passes a chunk and a block
+ * size, and sys_mempool_allocate_block hands back a block from it. The
+ * free list lives in host memory so the guest sees only its own chunk. This is
+ * enough for the firmware's pool semantics and keeps allocation O(1); it does
+ * not try to reproduce RPCS3's blocking condition variable. A guest that
+ * drains its pool gets NULL from allocate, which is the same observable
+ * failure mode as a non-blocking try in this runtime.
+ * -----------------------------------------------------------------------*/
+
+#define MAX_MEMPOOLS 32
+
+typedef struct {
+    int  in_use;
+    u32  id;
+    u32  chunk;          /* guest EA of the caller's storage */
+    u64  chunk_size;
+    u64  block_size;
+    u64  ralignment;
+    u32* free_blocks;    /* host array of guest EAs */
+    u32  free_count;
+    u32  free_capacity;
+} MemPoolSlot;
+
+static MemPoolSlot s_mempools[MAX_MEMPOOLS];
+static u32 s_next_mempool_id = 1;
+
+/* Caller holds slot_lock(). */
+static MemPoolSlot* mempool_find(u32 id)
+{
+    for (int i = 0; i < MAX_MEMPOOLS; i++)
+        if (s_mempools[i].in_use && s_mempools[i].id == id)
+            return &s_mempools[i];
+    return NULL;
+}
+
+s32 sys_mempool_create(sys_mempool_t* mempool, void* chunk,
+                       u64 chunk_size, u64 block_size, u64 ralignment)
+{
+    u32 mempool_ea = (u32)(uintptr_t)mempool;
+    u32 chunk_ea   = (u32)(uintptr_t)chunk;
+
+    printf("[sysPrxForUser] sys_mempool_create(mempool=0x%08X, chunk=0x%08X, "
+           "chunk_size=%llu, block_size=%llu, ralignment=%llu)\n",
+           mempool_ea, chunk_ea, (unsigned long long)chunk_size,
+           (unsigned long long)block_size, (unsigned long long)ralignment);
+
+    if (!mempool || !chunk)
+        return CELL_EINVAL;
+    if (block_size == 0 || block_size > chunk_size)
+        return CELL_EINVAL;
+    if ((chunk_ea & 7u) != 0)
+        return CELL_EINVAL;
+
+    u64 alignment = ralignment;
+    if (alignment == 0 || alignment == 2)
+        alignment = 4;
+    if ((alignment & (alignment - 1)) != 0)
+        return CELL_EINVAL;
+
+    u64 blocks64 = chunk_size / block_size;
+    if (blocks64 == 0 || blocks64 > 0xFFFFFFFFull)
+        return CELL_EINVAL;
+    if ((uint64_t)chunk_ea + chunk_size > 0x100000000ull)
+        return CELL_EINVAL;
+
+    u32 block_count = (u32)blocks64;
+    if ((size_t)block_count > SIZE_MAX / sizeof(u32))
+        return CELL_ENOMEM;
+
+    u32* blocks = (u32*)malloc((size_t)block_count * sizeof(u32));
+    if (!blocks)
+        return CELL_ENOMEM;
+
+    for (u32 i = 0; i < block_count; i++)
+        blocks[i] = chunk_ea + (u32)((u64)i * block_size);
+
+    slot_lock();
+    int slot = -1;
+    for (int i = 0; i < MAX_MEMPOOLS; i++) {
+        if (!s_mempools[i].in_use) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        slot_unlock();
+        free(blocks);
+        return CELL_ENOMEM;
+    }
+
+    u32 id = s_next_mempool_id++;
+    if (id == 0)
+        id = s_next_mempool_id++;      /* never hand out the null handle */
+
+    MemPoolSlot* p = &s_mempools[slot];
+    memset(p, 0, sizeof(*p));
+    p->in_use       = 1;
+    p->id           = id;
+    p->chunk        = chunk_ea;
+    p->chunk_size   = chunk_size;
+    p->block_size   = block_size;
+    p->ralignment   = alignment;
+    p->free_blocks  = blocks;
+    p->free_count   = block_count;
+    p->free_capacity = block_count;
+
+    vm_write32(mempool_ea, id);
+    slot_unlock();
+    return CELL_OK;
+}
+
+s32 sys_mempool_destroy(sys_mempool_t mempool)
+{
+    slot_lock();
+    MemPoolSlot* p = mempool_find(mempool);
+    if (!p) {
+        slot_unlock();
+        return CELL_ESRCH;
+    }
+    printf("[sysPrxForUser] sys_mempool_destroy(id=%u)\n", mempool);
+    free(p->free_blocks);
+    memset(p, 0, sizeof(*p));
+    slot_unlock();
+    return CELL_OK;
+}
+
+void* sys_mempool_allocate_block(sys_mempool_t mempool)
+{
+    slot_lock();
+    MemPoolSlot* p = mempool_find(mempool);
+    if (!p || p->free_count == 0) {
+        slot_unlock();
+        return NULL;
+    }
+    u32 block = p->free_blocks[--p->free_count];
+    slot_unlock();
+    return (void*)(uintptr_t)block;
+}
+
+void* sys_mempool_try_allocate_block(sys_mempool_t mempool)
+{
+    return sys_mempool_allocate_block(mempool);
+}
+
+s32 sys_mempool_free_block(sys_mempool_t mempool, void* block)
+{
+    u32 block_ea = (u32)(uintptr_t)block;
+
+    slot_lock();
+    MemPoolSlot* p = mempool_find(mempool);
+    if (!p) {
+        slot_unlock();
+        return CELL_EINVAL;
+    }
+
+    if (block_ea < p->chunk ||
+        (uint64_t)block_ea + p->block_size > (uint64_t)p->chunk + p->chunk_size ||
+        ((block_ea - p->chunk) % (u32)p->block_size) != 0) {
+        slot_unlock();
+        return CELL_EINVAL;
+    }
+
+    if (p->free_count >= p->free_capacity) {
+        slot_unlock();
+        return CELL_EINVAL;
+    }
+    p->free_blocks[p->free_count++] = block_ea;
+    slot_unlock();
+    return CELL_OK;
+}
+
+u64 sys_mempool_get_count(sys_mempool_t mempool)
+{
+    slot_lock();
+    MemPoolSlot* p = mempool_find(mempool);
+    u64 count = p ? (u64)p->free_count : 0;
+    slot_unlock();
+    return count;
+}
+
+/* ---------------------------------------------------------------------------
  * PRX utilities
  * -----------------------------------------------------------------------*/
 

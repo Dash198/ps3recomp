@@ -39,6 +39,12 @@ s32 cellUsbdEnd(void)
     return CELL_OK;
 }
 
+s32 cellUsbdSetThreadPriority2(s32 priority)
+{
+    printf("[cellUsbd] SetThreadPriority2(priority=%d)\n", priority);
+    return CELL_OK;
+}
+
 s32 cellUsbdRegisterLdd(const CellUsbdLddOps* ops)
 {
     /* CellUsbdLddOps leads with a char* -- a 4-byte EA to the guest. */
@@ -63,6 +69,29 @@ s32 cellUsbdUnregisterLdd(const CellUsbdLddOps* ops)
             return CELL_OK;
         }
     }
+    return CELL_OK;
+}
+
+/* Extra LDD registration lives in the same stub surface as the base class;
+ * no USB device is enumerated, so there is nothing to bind. The title calls
+ * the unregister side during teardown even after cellUsbdEnd, so these stay
+ * CELL_OK rather than reporting an uninitialized state that would turn a
+ * diagnostic path into a failure. */
+s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops)
+{
+    (void)ops;
+    return CELL_OK;
+}
+
+s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops)
+{
+    (void)ops;
+    return CELL_OK;
+}
+
+s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops)
+{
+    (void)ops;
     return CELL_OK;
 }
 

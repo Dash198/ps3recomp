@@ -59,8 +59,18 @@ typedef struct CellUsbdLddOps {
 s32 cellUsbdInit(void);
 s32 cellUsbdEnd(void);
 
+/* USB service thread priority. No device or service thread is modelled here,
+ * so the priority is accepted and ignored; the title only needs CELL_OK. */
+s32 cellUsbdSetThreadPriority2(s32 priority);
+
 s32 cellUsbdRegisterLdd(const CellUsbdLddOps* ops);
 s32 cellUsbdUnregisterLdd(const CellUsbdLddOps* ops);
+/* Extra/composite LDD registration is accepted but not modelled. These are
+ * separate firmware entry points even though the current title only checks
+ * that they succeed. */
+s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops);
+s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops);
+s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops);
 
 s32 cellUsbdGetDeviceList(CellUsbdDeviceInfo* list, u32 maxDevices,
                             u32* numDevices);

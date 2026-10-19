@@ -2308,6 +2308,19 @@ static uint32_t ppu_code_hi(void)
     return hi;
 }
 
+/* Raw (not byte-swapped) guest word read for diagnostics. vm_oob() alone is
+ * not enough: a PPU thread's guard page is inside the arena and inside
+ * ppu_vm_size, but is deliberately PROT_NONE. The guard registry records
+ * those ranges so a dump can skip them instead of taking a host fault while
+ * trying to report one. */
+static inline bool guest_read_raw32(uint32_t ea, uint32_t* out)
+{
+    if (!vm_base || !out || !vm_guest_range_readable(ea, 4))
+        return false;
+    memcpy(out, vm_base + ea, 4);
+    return true;
+}
+
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 {
     if (!ctx || !vm_base) return;
@@ -2338,7 +2351,8 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
           fprintf(stderr, "%s\n", gr);
       } }
     if (!vm_oob(sp,4)) { char rw[600]; int rp=snprintf(rw,sizeof rw,"      rawstk:");
-        for (int i=0;i<24 && !vm_oob(sp+i*4,4);i++){ uint32_t t; memcpy(&t,vm_base+sp+i*4,4); rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
+        for (int i=0;i<24;i++){ uint32_t t; if (!guest_read_raw32(sp+(uint32_t)i*4, &t)) break;
+            rp+=snprintf(rw+rp,sizeof(rw)-rp," %08X",__builtin_bswap32(t)); }
         fprintf(stderr,"%s\n",rw); }
     /* Identify the worker's dispatched method: func_000750A8 vcalls
      * [[arg+0xC]+0] (code) with toc [[arg+0xC]+4]. Dump for the known thread
@@ -2347,12 +2361,12 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     { const uint32_t args[2] = {0x40003450u, 0x40003E80u};
       for (int j=0;j<2;j++){ uint32_t o=args[j];
         if (vm_oob(o+0x10,4)) continue;
-        uint32_t vt, code, toc; { uint32_t t;
-          memcpy(&t,vm_base+o+0xC,4); vt=__builtin_bswap32(t);
-          if (vt<0x600000 || vt>=0x50000000u) { /* vt could be a guest ptr */ }
-        }
-        if (!vm_oob(vt,8)) { uint32_t t; memcpy(&t,vm_base+vt,4); code=__builtin_bswap32(t);
-          memcpy(&t,vm_base+vt+4,4); toc=__builtin_bswap32(t);
+        uint32_t vt = 0, code = 0, toc = 0;
+        if (!guest_read_raw32(o+0xC, &vt)) continue;
+        vt = __builtin_bswap32(vt);
+        if (guest_read_raw32(vt, &code) && guest_read_raw32(vt + 4, &toc)) {
+          code = __builtin_bswap32(code);
+          toc  = __builtin_bswap32(toc);
           fprintf(stderr,"      ARG[0x%08X] vtbl=0x%08X -> method code=0x%08X toc=0x%08X (worker body?)\n", o, vt, code, toc); }
       } }
     /* The real frame chain FIRST, then the scan.
@@ -2370,12 +2384,11 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     { char bc[900]; int bp = snprintf(bc, sizeof bc, "[GSTACK:%s] chain:", tag ? tag : "?");
       uint32_t f = sp;
       for (int d = 0; d < 24 && bp < 820; d++) {
-          if (vm_oob(f, 8)) break;
-          uint32_t t; memcpy(&t, vm_base + f + 4, 4);   /* low half of the 64-bit back chain */
+          uint32_t t;
+          if (!guest_read_raw32(f + 4, &t)) break;      /* low half of the 64-bit back chain */
           uint32_t prev = __builtin_bswap32(t);
-          if (prev <= f || vm_oob(prev + 0x14, 4)) break;   /* stacks grow down */
-          memcpy(&t, vm_base + prev + 0x14, 4);         /* low half of the saved lr */
-          uint32_t ra = __builtin_bswap32(t);
+          if (prev <= f || !guest_read_raw32(prev + 0x14, &t)) break;   /* stacks grow down */
+          uint32_t ra = __builtin_bswap32(t);            /* low half of the saved lr */
           if (ra >= 0x10000 && ra < ppu_code_hi()) {
               uint32_t bg = 0;
               for (uint64_t k = 0; k < function_table_count; k++) {
@@ -2389,8 +2402,9 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     char gs[1200]; int gp = snprintf(gs, sizeof gs, "[GSTACK:%s] sp=0x%08X:", tag ? tag : "?", sp);
     uint32_t last = 0;
     for (int i = 0; i < 700 && gp < 1100; i++) {
-        uint32_t a = sp + i*4; if (vm_oob(a,4)) break;
-        uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
+        uint32_t a = sp + i*4;
+        uint32_t t; if (!guest_read_raw32(a, &t)) break;
+        uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= ppu_code_hi()) continue;
         uint32_t bg = 0;
         for (uint64_t k = 0; k < function_table_count; k++) { uint32_t aa = function_table[k].addr; if (aa <= w && aa > bg) bg = aa; }
@@ -2427,11 +2441,10 @@ extern "C" int ppu_guest_chain_fmt(char* out, size_t n, ppu_context* ctx, int ma
     uint32_t f = (uint32_t)ctx->gpr[1];
     p += snprintf(out + p, n - (size_t)p, "sp=0x%08X", f);
     for (int d = 0; d < max_depth && p < (int)n - 40; d++) {
-        if (vm_oob(f, 8)) break;
-        uint32_t t; memcpy(&t, vm_base + f + 4, 4);
+        uint32_t t;
+        if (!guest_read_raw32(f + 4, &t)) break;
         uint32_t prev = __builtin_bswap32(t);
-        if (prev <= f || vm_oob(prev + 0x14, 4)) break;   /* stacks grow down */
-        memcpy(&t, vm_base + prev + 0x14, 4);
+        if (prev <= f || !guest_read_raw32(prev + 0x14, &t)) break;   /* stacks grow down */
         uint32_t ra = __builtin_bswap32(t);
         if (ra >= 0x10000u && ra < ppu_code_hi()) {
             uint32_t bg = 0;
@@ -2537,8 +2550,9 @@ int ppu_alloc_probe(void* vctx, uint32_t size, uint32_t obj, uint32_t sp)
     char gs[1400]; int gp = snprintf(gs, sizeof gs, "      GSTACK-codeptrs:");
     uint32_t last = 0;
     for (int i = 0; i < 900 && gp < 1300; i++) {
-        uint32_t a = sp + i*4; if (vm_oob(a,4)) break;
-        uint32_t t; memcpy(&t, vm_base + a, 4); uint32_t w = __builtin_bswap32(t);
+        uint32_t a = sp + i*4;
+        uint32_t t; if (!guest_read_raw32(a, &t)) break;
+        uint32_t w = __builtin_bswap32(t);
         if (w < 0x10000 || w >= 0x900000) continue;
         uint32_t bg = 0;
         for (uint64_t k = 0; k < function_table_count; k++) { uint32_t aa = function_table[k].addr; if (aa <= w && aa > bg) bg = aa; }

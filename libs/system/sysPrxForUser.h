@@ -164,6 +164,24 @@ void* _sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
 s32   _sys_heap_free(sys_heap_t heap, void* ptr);
 
 /* ---------------------------------------------------------------------------
+ * Fixed-block memory pools (sysPrxForUser)
+ *
+ * A pool is a guest-supplied chunk divided into equal blocks. The handle is
+ * an opaque u32 written through the first argument, matching the firmware ABI
+ * that RPCS3 models as sys_mempool_t.
+ * -----------------------------------------------------------------------*/
+
+typedef u32 sys_mempool_t;
+
+s32  sys_mempool_create(sys_mempool_t* mempool, void* chunk,
+                        u64 chunk_size, u64 block_size, u64 ralignment);
+s32  sys_mempool_destroy(sys_mempool_t mempool);
+s32  sys_mempool_free_block(sys_mempool_t mempool, void* block);
+u64  sys_mempool_get_count(sys_mempool_t mempool);
+void* sys_mempool_allocate_block(sys_mempool_t mempool);
+void* sys_mempool_try_allocate_block(sys_mempool_t mempool);
+
+/* ---------------------------------------------------------------------------
  * PRX utilities
  * -----------------------------------------------------------------------*/
 

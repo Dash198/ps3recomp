@@ -39,6 +39,11 @@ extern "C" {
 #define CELL_KB_CODETYPE_RAW        0  /* USB HID scan codes */
 #define CELL_KB_CODETYPE_ASCII      1  /* ASCII-mapped codes */
 
+/* Keyboard arrangements */
+#define CELL_KB_ARRANGEMENT_101      0
+#define CELL_KB_ARRANGEMENT_106      1
+#define CELL_KB_ARRANGEMENT_106_KANA 2
+
 /* Modifier key flags (in mkey field) */
 #define CELL_KB_MKEY_L_CTRL         (1 << 0)
 #define CELL_KB_MKEY_L_SHIFT        (1 << 1)
@@ -141,6 +146,14 @@ typedef struct CellKbInfo {
     u32 status[CELL_KB_MAX_KEYBOARDS];  /* Per-keyboard status */
 } CellKbInfo;
 
+/* Keyboard configuration returned by cellKbGetConfiguration. Guest layout is
+ * three big-endian u32s; the HLE writes them through vm_write32. */
+typedef struct CellKbConfig {
+    u32 arrange;                        /* CELL_KB_ARRANGEMENT_* */
+    u32 read_mode;                      /* CELL_KB_RMODE_* */
+    u32 code_type;                      /* CELL_KB_CODETYPE_* */
+} CellKbConfig;
+
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
@@ -148,6 +161,8 @@ typedef struct CellKbInfo {
 s32 cellKbInit(u32 max_connect);
 s32 cellKbEnd(void);
 s32 cellKbGetData(u32 port_no, CellKbData* data);
+s32 cellKbRead(u32 port_no, CellKbData* data);
+s32 cellKbGetConfiguration(u32 port_no, CellKbConfig* config);
 s32 cellKbGetInfo(CellKbInfo* info);
 s32 cellKbSetReadMode(u32 port_no, u32 rmode);
 s32 cellKbSetCodeType(u32 port_no, u32 codetype);

@@ -2662,6 +2662,18 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     return CELL_OK;
 }
 
+/* NID: 0x626E8518
+ *
+ * Same mapping as cellGcmMapEaIoAddress, with one ordering hint that this
+ * host-memory implementation cannot express. Do not reject a non-zero flag:
+ * the guest's only requirement is that the mapping exists. */
+s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
+{
+    printf("[cellGcmSys] MapEaIoAddressWithFlags(ea=0x%08X, io=0x%08X, "
+           "size=0x%X, flags=0x%X)\n", ea, io, size, flags);
+    return cellGcmMapEaIoAddress(ea, io, size);
+}
+
 /* NID: 0xDB23E867 (disambiguation by context) */
 s32 cellGcmUnmapEaIoAddress(u32 ea)
 {

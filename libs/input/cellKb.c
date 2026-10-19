@@ -29,6 +29,7 @@ extern void vm_write32(unsigned long long a, unsigned int   v);
 
 typedef struct {
     int  connected;
+    u32  arrange;       /* CELL_KB_ARRANGEMENT_* */
     u32  rmode;         /* CELL_KB_RMODE_INPUTCHAR or CELL_KB_RMODE_PACKET */
     u32  codetype;      /* CELL_KB_CODETYPE_RAW or CELL_KB_CODETYPE_ASCII */
     u32  mkey;          /* Current modifier flags */
@@ -136,6 +137,7 @@ s32 cellKbInit(u32 max_connect)
 
     /* Assume keyboard 0 is always connected on the host */
     s_kb_ports[0].connected = 1;
+    s_kb_ports[0].arrange = CELL_KB_ARRANGEMENT_101;
     s_kb_ports[0].rmode = CELL_KB_RMODE_INPUTCHAR;
     s_kb_ports[0].codetype = CELL_KB_CODETYPE_ASCII;
 
@@ -203,6 +205,36 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
         vm_write32(ea + 0x08, (u32)count);
     }
 
+    return CELL_OK;
+}
+
+/* cellKbRead is the SDK's name for the read side; cellKbGetData is the older
+ * name this runtime exposed first. They take the same port and CellKbData, so
+ * keep one implementation rather than letting the two drift. */
+s32 cellKbRead(u32 port_no, CellKbData* data)
+{
+    return cellKbGetData(port_no, data);
+}
+
+/* Guest CellKbConfig layout (big-endian): +0x00 arrange u32, +0x04 read_mode
+ * u32, +0x08 code_type u32. */
+s32 cellKbGetConfiguration(u32 port_no, CellKbConfig* config)
+{
+    unsigned long long ea = (unsigned int)(uintptr_t)config;
+
+    if (!s_kb_initialized)
+        return CELL_KB_ERROR_UNINITIALIZED;
+
+    if (port_no >= s_kb_max_connect || !config)
+        return CELL_KB_ERROR_INVALID_PARAMETER;
+
+    KbPortState* kb = &s_kb_ports[port_no];
+    if (!kb->connected)
+        return CELL_KB_ERROR_NO_DEVICE;
+
+    vm_write32(ea + 0x00, kb->arrange);
+    vm_write32(ea + 0x04, kb->rmode);
+    vm_write32(ea + 0x08, kb->codetype);
     return CELL_OK;
 }
 
