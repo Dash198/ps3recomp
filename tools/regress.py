@@ -399,8 +399,18 @@ def bucket_index(b):
     return BUCKETS.index(b) if b in BUCKETS else -1
 
 
-def diff(golden, current):
-    """-> (failures, notes), each a list of strings."""
+def diff(golden, current, wall_clock=()):
+    """-> (failures, notes), each a list of strings.
+
+    `wall_clock` names occurrence counters that are samples of host scheduling
+    or throughput rather than functional milestones. The golden records the
+    minimum bucket observed on the reference platform; a port whose gate run is
+    faster (stdout/stderr to NUL, no logging) can land one decade lower without
+    any call disappearing. Those keys are reported as WALLCLOCK instead of
+    DROPPED. LOST, UNRESOLVED and every other DROPPED stay hard failures, and
+    the golden itself is never rewritten.
+    """
+    wall_clock = set(wall_clock)
     g_stream, g_counts, g_kv = golden
     c_stream, c_counts, c_kv = current
     g_set, c_set = set(g_stream), set(c_stream)
@@ -428,7 +438,12 @@ def diff(golden, current):
         if gi < 0 or ci < 0 or gi == ci:
             continue
         if ci < gi:
-            fails.append("DROPPED     %s  %s -> %s" % (k, g_counts[k], c_counts[k]))
+            if k in wall_clock:
+                notes.append("WALLCLOCK   %s  %s -> %s  (host-timing sample; "
+                             "tolerated by this port's wall_clock list)"
+                             % (k, g_counts[k], c_counts[k]))
+            else:
+                fails.append("DROPPED     %s  %s -> %s" % (k, g_counts[k], c_counts[k]))
         else:
             notes.append("RAISED      %s  %s -> %s" % (k, g_counts[k], c_counts[k]))
 
@@ -557,7 +572,8 @@ def cmd_check(ports, args):
 
         if shots:
             continue                    # the shots report above is the result
-        fails, notes = diff(parse_log(gp), parse_log(log))
+        fails, notes = diff(parse_log(gp), parse_log(log),
+                            wall_clock=port.get("wall_clock", ()))
 
         # A single run is not a verdict. The FIRST run after a build is the least
         # trustworthy one there is -- a cold page cache for a 36 MB executable and
@@ -575,7 +591,8 @@ def cmd_check(ports, args):
                   "a build is the flakiest one)" % name)
             status2, log2, _ = run_port(port, build=False, shots=False)
             if status2 == "ok":
-                fails2, notes2 = diff(parse_log(gp), parse_log(log2))
+                fails2, notes2 = diff(parse_log(gp), parse_log(log2),
+                                      wall_clock=port.get("wall_clock", ()))
                 if not fails2:
                     print("[%s] PASS     (first run disagreed: %s -- treated as "
                           "flake, not a regression)"

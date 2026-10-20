@@ -143,6 +143,24 @@ timeout = 90
 expect  = "timeout"
 env     = { PS3_VFS_ROOT = "../vfs" }
 
+# Occurrence counters that sample host scheduling/throughput rather than a
+# functional call. The golden records the minimum bucket Linux observed; the
+# Windows gate runs the same binary faster (stdout/stderr to NUL, no logging),
+# so these can land one decade lower while every call is still made. Only the
+# COUNT comparison is relaxed -- LOST, UNRESOLVED and any DROPPED not named here
+# still fail, and the golden is never rewritten. Rationale: RECOMP_STATUS.md,
+# Module 16 ("wall-clock counters use the minimum observed bucket").
+wall_clock = [
+  "hle:cellKbGetInfo",       # input poll loop, races module shutdown
+  "hle:cellKbRead",
+  "hle:cellMouseGetInfo",
+  "hle:cellPadGetData",
+  "hle:cellPadGetInfo2",
+  "hle:sys_lwcond_signal",   # idle-worker condvar tick
+  "sys:133",                 # event_queue_drain throughput (q6 chain lap rate)
+  "sys:47",                  # ppu_thread_set_priority calls from thread setup
+]
+
 # --- showcase titles -------------------------------------------------------
 
 [[port]]
