@@ -109,6 +109,18 @@ static void sys_process_is_stack(ppu_context* ctx)
 
 #ifdef _WIN32
 static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
+/* PS3_LWMUTEX_STAMP=0 opts back into the real Windows semaphore. Default 1:
+ * emulate the POSIX owner-stamp lwmutex, which is the cross-platform baseline
+ * the golden was recorded against. A real semaphore lets GT6's idle workers
+ * (which condwait in a 1 ms poll) barge ahead of the main thread forever and
+ * park it in sys_lwmutex_lock -- the intermittent 147-key Windows stall. */
+static int lwm_stamp_mode(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_LWMUTEX_STAMP");
+                 v = (e && *e) ? atoi(e) : 1; }
+    return v;
+}
 #endif
 static void sys_lwmutex_create(ppu_context* ctx)
 {
@@ -128,7 +140,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
-    { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
+    { HANDLE s = lwm_stamp_mode() ? NULL : lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
 #endif
     ctx->gpr[3] = 0;
 }
@@ -222,7 +234,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
      * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
     uint64_t timeout_us = ctx->gpr[4];
 #ifdef _WIN32
-    HANDLE s = lwm_sem(lwm);
+    HANDLE s = lwm_stamp_mode() ? NULL : lwm_sem(lwm);
     if (s) {
         /* Recursive re-lock by the current holder: bump the count, no wait.
          * Only the holder ever stamps owner=self, so this check is race-free. */
@@ -269,7 +281,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = LWM_SELF(ctx);
 #ifdef _WIN32
-    HANDLE s = lwm_sem(lwm);
+    HANDLE s = lwm_stamp_mode() ? NULL : lwm_sem(lwm);
     if (s) {
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
             vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
@@ -323,7 +335,7 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
                 fprintf(stderr, "%s\n", b); fflush(stderr);
             }
             sl->holder = 0; } }
-    HANDLE s = lwm_sem(lwm);
+    HANDLE s = lwm_stamp_mode() ? NULL : lwm_sem(lwm);
     /* Semaphore release works from ANY thread (unlike a CS) -- guest code
      * hands lwmutex ownership across threads. Over-release (unlock of a free
      * mutex) fails harmlessly at the max count of 1. */
@@ -362,6 +374,11 @@ static void sys_lwcond_wait(ppu_context* ctx)
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
 #ifdef _WIN32
+    if (lwm_stamp_mode()) {
+        /* Owner-stamp lwmutex: nothing to release; yield the same 1 ms the
+         * POSIX path spends so a guest condvar wait is not a full-core spin. */
+        Sleep(1);
+    } else {
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
@@ -373,6 +390,7 @@ static void sys_lwcond_wait(ppu_context* ctx)
         WaitForSingleObject(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+    }
     }
 #else
     /* Non-Windows sys_lwmutex is an owner stamp rather than a real lock, so
