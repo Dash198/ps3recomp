@@ -294,6 +294,14 @@ void rsx_null_backend_shutdown(void)
            (unsigned long long)s_state.frame_count);
 }
 
+/* The Windows branch registers null_present through the rsx_backend vtable;
+ * the public entry point used by the frame clock was only implemented in the
+ * headless branch. Keep both backends callable through the same API. */
+void rsx_null_backend_present(void)
+{
+    null_present(&s_state, 0);
+}
+
 int rsx_null_backend_pump_messages(void)
 {
     MSG msg;
