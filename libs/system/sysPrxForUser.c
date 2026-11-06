@@ -1217,6 +1217,15 @@ u64 sys_mempool_get_count(sys_mempool_t mempool)
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
+/* sys_crashdump: the title registers a user log area during boot. There is no
+ * crash-dump backend in the runtime, so accept the registration and keep the
+ * returned status clean. The guest uses the value only for diagnostics. */
+s32 sys_crash_dump_set_user_log_area(u32 area, void* base, u64 size)
+{
+    (void)area; (void)base; (void)size;
+    return CELL_OK;
+}
+
 s32 sys_prx_exitspawn_with_level(void)
 {
     printf("[sysPrxForUser] sys_prx_exitspawn_with_level() - no-op\n");

@@ -113,6 +113,71 @@ static int spu_step(spu_context* ctx) {
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
     spu_ins d; spu_decode1(insn, pc, &d);
     uint32_t next = pc + 4;
+    {   /* SPURS_TRACE_PC=lo:hi[:n]: per-instruction trace of one LS range.
+         * The SPURS policy module's claim helper (GT6 LS 0x23F0..) runs in the
+         * interpreter, where the branch conditions are otherwise invisible. */
+        static uint32_t lo = 1, hi = 0; static int lim = 0, cnt = 0, init = 0;
+        static uint32_t r3t = 0;
+        if (!init) {
+            init = 1;
+            const char* e = getenv("SPURS_TRACE_PC");
+            if (e && *e) {
+                char* endp = 0;
+                lo = (uint32_t)strtoul(e, &endp, 16);
+                if (endp && *endp == ':') hi = (uint32_t)strtoul(endp + 1, &endp, 16);
+                if (endp && *endp == ':') lim = atoi(endp + 1);
+                if (!lim) lim = 512;
+            }
+            const char* t = getenv("SPURS_TRACE_R3");
+            if (t && *t) r3t = (uint32_t)strtoul(t, 0, 16);
+        }
+        if (lo <= m && m < hi && cnt < lim &&
+            (!r3t || ctx->gpr[3]._u32[0] == r3t || ctx->gpr[52]._u32[0] == r3t)) {
+            cnt++;
+            fprintf(stderr, "[pmtr] %05X %08X r0=%08X r3=%08X r4=%08X r5=%08X r6=%08X "
+                    "r7=%08X r8=%08X r9=%08X r62=%08X r68=%08X r70=%08X r57=%08X "
+                    "r60=%08X r66=%08X\n",
+                    m, insn, ctx->gpr[0]._u32[0],
+                    ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0],
+                    ctx->gpr[6]._u32[0], ctx->gpr[7]._u32[0], ctx->gpr[8]._u32[0],
+                    ctx->gpr[9]._u32[0], ctx->gpr[62]._u32[0], ctx->gpr[68]._u32[0],
+                    ctx->gpr[70]._u32[0], ctx->gpr[57]._u32[0], ctx->gpr[60]._u32[0],
+                    ctx->gpr[66]._u32[0]);
+            if (cnt == lim) fprintf(stderr, "[pmtr] trace limit reached\n");
+        }
+    }
+
+    /* SPU interrupt enable/disable bits live on the REGISTER-INDIRECT branch
+     * forms (bi/bisl/biz/... and iret): bit 18 = E (arm), bit 19 = D (disarm).
+     * The lifted code honours them (the lifter emits `int_enable = 1/0`), but
+     * this interpreter did not, so a module that arms interrupts for a single
+     * instruction before disarming them (GT6's policy module: `bi` with E at LS
+     * 0x2D2C, `bi` with D at 0x2D34) never actually had them enabled on the
+     * interpreted path. Must run BEFORE the switch (it was previously placed
+     * after the opening brace, i.e. unreachable). */
+    { int rr_branch = (d.op == SPU_bi || d.op == SPU_bisl || d.op == SPU_iret ||
+                       d.op == SPU_biz || d.op == SPU_binz ||
+                       d.op == SPU_bihz || d.op == SPU_bihnz);
+      if (rr_branch) {
+          if (insn & 0x40000u)      ctx->int_enable = 1;
+          else if (insn & 0x80000u) ctx->int_enable = 0;
+      }
+      {   /* PS3_IRQDBG2=1: arm-boundary diagnosis. */
+          static int _d2 = -1;
+          if (_d2 < 0) _d2 = getenv("PS3_IRQDBG2") ? 1 : 0;
+          if (_d2 && ctx->policy_mode) {
+              uint32_t m = pc & SPU_LS_MASK;
+              if (m == 0x2D2Cu || m == 0x2D30u) {
+                  static int _n = 0;
+                  if (_n++ < 24)
+                      fprintf(stderr, "[irqdbg2] pc=%05X insn=%08X op=%d rr=%d E=%d D=%d "
+                              "ie_after=%d ev=0x%X mask=0x%X\n",
+                              m, insn, (int)d.op, rr_branch,
+                              (insn & 0x40000u) ? 1 : 0, (insn & 0x80000u) ? 1 : 0,
+                              ctx->int_enable, ctx->event_status, ctx->event_mask);
+              }
+          }
+      } }
 
     switch (d.op) {
     /* immediates / loads */
@@ -128,6 +193,20 @@ static int spu_step(spu_context* ctx) {
     case SPU_stqd: case SPU_stqx: case SPU_stqa: case SPU_stqr: {
         uint32_t a = (d.op==SPU_stqd) ? PREF(A)+ (uint32_t)I
                    : (d.op==SPU_stqx) ? PREF(A)+PREF(B) : d.tgt;
+        {   /* SPURS_LSWATCH: name a lifted store that lands on a watched LS
+             * word (GT6's PM code at 0x3648 is zeroed during its run). */
+            static int64_t _w = -2;
+            if (_w == -2) { const char* e = getenv("SPURS_LSWATCH");
+                            _w = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+            if (_w >= 0 && (int64_t)(a & SPU_LS_MASK) <= _w + 15 &&
+                (int64_t)(a & SPU_LS_MASK) + 16 > _w) {
+                static int _n = 0;
+                if (_n++ < 32)
+                    fprintf(stderr, "[ls-store] pc=%05X op=%d a=%05X val=%08X.%08X.%08X.%08X img=%d\n",
+                            m, (int)d.op, a & SPU_LS_MASK, DST._u32[0], DST._u32[1],
+                            DST._u32[2], DST._u32[3], ctx->image_id);
+            }
+        }
         spu_ls_write128(ctx, a, DST); break; }
     /* integer arithmetic */
     case SPU_a:  DST = spu_a(A,B); break;
@@ -356,6 +435,101 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
+        /* SPURS kernel services for a policy module: exitToKernel (0x9C0) and
+         * selectWorkload (0x9D0) are the two reserved LS addresses planted in
+         * the SpursKernelContext. spu_indirect_branch honors them for
+         * lifted/microstep dispatch; the interpreter path must too, otherwise a
+         * PM that returns to the kernel through interpreted code executes the
+         * zero word there as a `stop` and ends the run (GT6's wid=5/6 PM
+         * reached 0x9C4 and halted before touching its job queue). */
+        if (ctx->policy_mode && ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
+            extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+            g_spurs_pm_exited = 1;
+            { static int _t = -1; if (_t < 0) _t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (_t) { static unsigned long _n = 0; unsigned long n = ++_n;
+                if (n <= 64 || (n & 0xFFF) == 0)
+                    fprintf(stderr, "[spurs-pm] exit-to-kernel (interp) #%lu (r3=0x%08X polls=%u)\n",
+                            n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
+            ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+            { extern void spu_halt(spu_context*); spu_halt(ctx); }
+        }
+        if (ctx->policy_mode && ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
+            extern volatile unsigned g_spurs_pm_polls;
+            unsigned n = ++g_spurs_pm_polls;
+            if (n <= 4 || (n % 4096) == 0)
+                fprintf(stderr, "[spurs-pm] poll (interp) #%u (r3=0x%08X) -> continue\n",
+                        n, ctx->gpr[3]._u32[0]);
+            ctx->gpr[3] = spu_make_preferred_u32(0);
+            ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+            continue;
+        }
+        {   /* PS3_IRQDBG4=1: per-STEP log through the module's arm window. */
+            static int _d4 = -1;
+            if (_d4 < 0) _d4 = getenv("PS3_IRQDBG4") ? 1 : 0;
+            if (_d4 && ctx->policy_mode) {
+                uint32_t m = ctx->pc & SPU_LS_MASK;
+                if (m >= 0x2D28u && m <= 0x2D34u) {
+                    static int _n = 0;
+                    if (_n++ < 60)
+                        fprintf(stderr, "[irqdbg4] pc=%05X ie=%d ev=0x%X mask=0x%X "
+                                "parked=0x%X srr0=%05X\n", m, ctx->int_enable,
+                                ctx->event_status, ctx->event_mask,
+                                ctx->list_stall_mask, ctx->srr0 & SPU_LS_MASK);
+                }
+            }
+        }
+        /* Architectural SPU interrupt, checked per INSTRUCTION.
+         *
+         * The lifted dispatch loops only offer the interrupt at trampoline
+         * boundaries, and the SPURS policy module arms interrupts for exactly
+         * one instruction (`bi` with E at PM LS 0x2D2C) before disarming them
+         * (`bi` with D at 0x2D34). The code between those two is not a lifted
+         * entry, so it runs HERE -- and until this check existed the interpreter
+         * had no interrupt test at all, which is why a pending stall-and-notify
+         * (`event_status & 0x2`) with `list_stall_mask` set was never delivered
+         * and the parked MFC list was never acked.
+         *
+         * Vector through the guest's LS-0 branch, exactly like
+         * spu_take_interrupt() on the lifted path. Registers need no host-side
+         * save/restore here: the interpreter keeps all state in ctx and the
+         * handler returns via `iret` -> srr0. */
+        {   /* PS3_IRQDBG2=1: one-shot state at the module's arm boundary (the
+             * instruction after its E-bit `bi`), to see which term is false. */
+            static int _d2 = -1;
+            if (_d2 < 0) _d2 = getenv("PS3_IRQDBG2") ? 1 : 0;
+            if (_d2 && ctx->policy_mode && (ctx->pc & SPU_LS_MASK) == 0x2D30u) {
+                static int _n = 0;
+                if (_n++ < 8)
+                    fprintf(stderr, "[irqdbg2] pc=02D30 ie=%d ev=0x%X mask=0x%X "
+                            "parked=0x%X\n", ctx->int_enable, ctx->event_status,
+                            ctx->event_mask, ctx->list_stall_mask);
+            }
+        }
+        if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+            const uint8_t* vs = ctx->ls;
+            uint32_t w0 = ((uint32_t)vs[0] << 24) | ((uint32_t)vs[1] << 16) |
+                          ((uint32_t)vs[2] << 8) | vs[3];
+            uint32_t op9 = w0 >> 23, tgt = 0;
+            int have = 0;
+            if (op9 == 0x060) {                 /* bra i16 (absolute) */
+                tgt = ((w0 >> 7) & 0xFFFF) << 2;  have = 1;
+            } else if (op9 == 0x064) {          /* br i16 (relative to LS 0) */
+                tgt = (((w0 >> 7) & 0xFFFF) << 2) & SPU_LS_MASK; have = 1;
+            }
+            if (have) {
+                ctx->srr0 = ctx->pc;
+                ctx->int_enable = 0;
+                ctx->pc = tgt & SPU_LS_MASK;
+                { static int _n = 0;
+                  if (_n++ < 16)
+                      fprintf(stderr, "[irq-interp] TAKEN pc(srr0)=%05X -> %05X "
+                              "ev=0x%X mask=0x%X parked=0x%X\n",
+                              ctx->srr0 & SPU_LS_MASK, ctx->pc,
+                              ctx->event_status, ctx->event_mask,
+                              ctx->list_stall_mask); }
+                continue;
+            }
+        }
         /* Match the lifted path: only synthetic HLE tasks may bypass the
          * resident policy. Real tasksets also store 0xA70 in their API table.
          * Preserve the legacy CRI return convention while invoking the HLE. */

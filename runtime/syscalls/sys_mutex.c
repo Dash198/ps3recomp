@@ -8,6 +8,7 @@
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -134,6 +135,9 @@ int64_t sys_mutex_create(ppu_context* ctx)
     if (id_out_addr != 0) {
         write_be32(id_out_addr, mutex_id);
     }
+    if (getenv("PS3_SYNCLOG"))
+        fprintf(stderr, "[SYNC] mutex_create id=%u id_at=0x%08X lr=0x%08X\n",
+                mutex_id, id_out_addr, (uint32_t)ctx->lr);
 
     mtx_table_unlock();
     return CELL_OK;
@@ -188,9 +192,13 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     if (!m->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    uint64_t caller_tid = ctx->thread_id;
+    { static int _d = -1;
+      if (_d < 0) _d = getenv("PS3_MUTEX5_DBG") ? 1 : 0;
+      if (_d && mutex_id == 5) { static int _n = 0;
+        if (_n++ < 64) fprintf(stderr, "[mutex5] lock tid=%llu lr=%08X\n",
+                               (unsigned long long)ctx->thread_id, (unsigned)ctx->lr); } }
 
-    /* Check for deadlock on non-recursive mutex */
+    uint64_t caller_tid = ctx->thread_id;
     if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
@@ -316,6 +324,12 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
     sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
     if (!m->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    { static int _d = -1;
+      if (_d < 0) _d = getenv("PS3_MUTEX5_DBG") ? 1 : 0;
+      if (_d && mutex_id == 5) { static int _n = 0;
+        if (_n++ < 64) fprintf(stderr, "[mutex5] unlock tid=%llu lr=%08X\n",
+                               (unsigned long long)ctx->thread_id, (unsigned)ctx->lr); } }
 
     uint64_t caller_tid = ctx->thread_id;
 

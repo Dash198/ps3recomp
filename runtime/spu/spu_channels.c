@@ -560,6 +560,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * and a store that lands after the read now leaves BOTH stale -- which
          * is what makes the lost-reservation event fire. */
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
+        { static int64_t _w = -2;
+          if (_w == -2) { const char* e = getenv("SPURS_LSWATCH");
+                          _w = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+          if (_w >= 0 && (int64_t)(ls - ctx->ls) <= _w + 3 &&
+              (int64_t)(ls - ctx->ls) + MFC_ATOMIC_LINE > _w) {
+              static int _n = 0;
+              if (_n++ < 32)
+                  fprintf(stderr, "[ls-write] GETLLAR ea=0x%08X -> LS 0x%05X (pc=0x%05X img=%d)\n",
+                          ea, (uint32_t)(ls - ctx->ls),
+                          (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
+          } }
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
          * come from the same instant. Reading guest memory twice lets a PPU store
@@ -1887,6 +1898,7 @@ static int spu_smc_microstep(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
     for (int steps = 0; steps < 4096; steps++) {
+        ctx->pc = pc;   /* keep the current PC visible to LS/watch diagnostics */
         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
         uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
@@ -1938,7 +1950,14 @@ static int spu_smc_microstep(spu_context* ctx)
             return 1;
         }
         if (op9 == 0x040 || op9 == 0x042 || op9 == 0x044 || op9 == 0x046) {
-            /* brz / brnz / brhz / brhnz rt,label (relative) */
+            /* brz / brnz / brhz / brhnz rt,label (relative).
+             * brhz/brhnz test the LOW halfword of the preferred word (the
+             * same predicate RPCS3's SPU interpreter uses: `_u32[0] & 0xFFFF`).
+             * Do not "correct" this to the high half: SPURS PMs feed these
+             * branches the result of `ceqhi` / `ceqh`, where the matching
+             * element lands in the low halfword (GT6's claim gate tests
+             * ceqhi(entry,1) on 0x00600001 -> 0x0000FFFF and only proceeds
+             * when the low half is non-zero). */
             uint32_t cv = ctx->gpr[rt]._u32[0];
             int taken;
             switch (op9) {
@@ -1954,6 +1973,21 @@ static int spu_smc_microstep(spu_context* ctx)
         }
         if (op8 == 0x24) {                                    /* stqd rt,i10(ra) */
             uint32_t a = (ctx->gpr[ra]._u32[0] + ((uint32_t)i10 << 4)) & SPU_LS_MASK & ~15u;
+            {   /* SPURS_LSWATCH: name the exact microstep instruction and its
+                 * address computation (the interpreter's ctx->pc is stale here). */
+                static int64_t _w = -2;
+                if (_w == -2) { const char* e = getenv("SPURS_LSWATCH");
+                                _w = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+                if (_w >= 0 && (int64_t)a <= _w + 15 && (int64_t)a + 16 > _w) {
+                    static int _n = 0;
+                    if (_n++ < 16)
+                        fprintf(stderr, "[smc-stqd] pc=%05X w=%08X rt=%u ra=%u "
+                                "gpr[ra]=%05X i10=%d a=%05X val=%08X.%08X.%08X.%08X\n",
+                                pc, w, rt, ra, ctx->gpr[ra]._u32[0], i10, a,
+                                ctx->gpr[rt]._u32[0], ctx->gpr[rt]._u32[1],
+                                ctx->gpr[rt]._u32[2], ctx->gpr[rt]._u32[3]);
+                }
+            }
             spu_ls_write128(ctx, a, ctx->gpr[rt]);
             pc += 4; continue;
         }
@@ -1963,7 +1997,11 @@ static int spu_smc_microstep(spu_context* ctx)
             pc += 4; continue;
         }
         if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
-            uint32_t a = (((w >> 7) & 0xFFFF) << 4) & SPU_LS_MASK & ~15u;
+            /* The RI16 immediate is the absolute address in WORDS (<<2).
+             * This used <<4, so `stqa r2,0xD90` (GT6 PM's DMA-queue init)
+             * wrote LS 0x3640 -- the PM's own code/thunk -- instead of 0xD90,
+             * and the PM then branched to the zeroed word and stopped. */
+            uint32_t a = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;
             if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[rt]);
             else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
@@ -2051,6 +2089,24 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    {   /* PS3_IRQDBG5=1: log every dispatch of the module's arm window, to see
+         * what clears int_enable between the E-bit bi at 0x2D2C (lifted) and
+         * the next entry. The interpreter logs the same PCs at its loop top, so
+         * the two logs together bracket the lifted execution. */
+        static int _d5 = -1;
+        if (_d5 < 0) _d5 = getenv("PS3_IRQDBG5") ? 1 : 0;
+        if (_d5 && ctx->policy_mode) {
+            uint32_t m = ctx->pc & SPU_LS_MASK;
+            if (m >= 0x2D28u && m <= 0x2D34u) {
+                static int _n = 0;
+                if (_n++ < 60)
+                    fprintf(stderr, "[irqdbg5] disp pc=%05X ie=%d ev=0x%X mask=0x%X "
+                            "parked=0x%X srr0=%05X\n", m, ctx->int_enable,
+                            ctx->event_status, ctx->event_mask,
+                            ctx->list_stall_mask, ctx->srr0 & SPU_LS_MASK);
+            }
+        }
+    }
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first

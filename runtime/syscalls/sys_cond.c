@@ -121,6 +121,18 @@ int64_t sys_cond_destroy(ppu_context* ctx)
 int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
+    {   /* PS3_COND_BT=1: name the guest loop waiting on cond 5, the GCM
+         * completion event (the RSX user-command handler signals it). */
+        static int _bt = -1;
+        if (_bt < 0) _bt = getenv("PS3_COND_BT") ? 1 : 0;
+        if (_bt && LV2_ARG_U32(ctx, 0) == 5) {
+            static int _n = 0;
+            if (_n++ < 4) {
+                extern void ppu_dump_guest_stack(ppu_context*, const char*);
+                ppu_dump_guest_stack(ctx, "cond5-wait");
+            }
+        }
+    }
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
     const char* peek = getenv("PS3_COND_PEEK");
     if (peek) {
@@ -139,13 +151,25 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
 #endif
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
+    const char* cond_dbg = getenv("PS3_COND_DBG");
     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
-    if (!c) return (int32_t)CELL_ESRCH;
+    if (!c) {
+        if (cond_dbg) fprintf(stderr, "[cond] wait id=%u tid=%llu ESRCH\n",
+                              LV2_ARG_U32(ctx, 0), (unsigned long long)ctx->thread_id);
+        return (int32_t)CELL_ESRCH;
+    }
     sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
     if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
     if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
+        if (cond_dbg) fprintf(stderr,
+            "[cond] wait id=%u tid=%llu EPERM owner=%llu cnt=%d mid=%u\n",
+            LV2_ARG_U32(ctx, 0), (unsigned long long)ctx->thread_id,
+            (unsigned long long)m->owner_tid, m->lock_count, c->mutex_id);
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
+    if (cond_dbg) fprintf(stderr, "[cond] wait id=%u tid=%llu timeout=%llu enter\n",
+                          LV2_ARG_U32(ctx, 0), (unsigned long long)ctx->thread_id,
+                          (unsigned long long)timeout);
     struct sys_cond_waiter waiter = {NULL, 0};
     struct sys_cond_waiter** tail = &c->waiters;
     while (*tail) tail = &(*tail)->next;
@@ -198,6 +222,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
+    if (cond_dbg) fprintf(stderr, "[cond] wait id=%u tid=%llu result=%d\n",
+                          LV2_ARG_U32(ctx, 0), (unsigned long long)ctx->thread_id, result);
     return result;
 }
 
@@ -219,11 +245,29 @@ static int64_t signal_cond(uint32_t id, int all)
     return CELL_OK;
 }
 
-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal(ppu_context* ctx) {
+    if (getenv("PS3_CONDSIG_DBG"))
+        fprintf(stderr, "[condsig] id=%u tid=%llu lr=%08X\n",
+                LV2_ARG_U32(ctx, 0), (unsigned long long)ctx->thread_id,
+                (unsigned)ctx->lr);
+    return signal_cond(LV2_ARG_U32(ctx, 0), 0);
+}
+int64_t sys_cond_signal_all(ppu_context* ctx) {
+    if (getenv("PS3_CONDSIG_DBG"))
+        fprintf(stderr, "[condsig] all id=%u tid=%llu lr=%08X\n",
+                LV2_ARG_U32(ctx, 0), (unsigned long long)ctx->thread_id,
+                (unsigned)ctx->lr);
+    return signal_cond(LV2_ARG_U32(ctx, 0), 1);
+}
 
 /* Preserve upstream's current broadcast fallback for signal_to. */
-int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal_to(ppu_context* ctx) {
+    if (getenv("PS3_CONDSIG_DBG"))
+        fprintf(stderr, "[condsig] to id=%u target=%u tid=%llu lr=%08X\n",
+                LV2_ARG_U32(ctx, 0), LV2_ARG_U32(ctx, 1),
+                (unsigned long long)ctx->thread_id, (unsigned)ctx->lr);
+    return signal_cond(LV2_ARG_U32(ctx, 0), 1);
+}
 
 void sys_cond_init(lv2_syscall_table* tbl)
 {

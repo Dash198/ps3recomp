@@ -64,6 +64,29 @@ extern "C" void ppu_guest_caller(char* out, size_t n)
     }
 }
 
+/* Same host-stack walk, but skip the first `skip` lifted frames. The setjmp
+ * trace uses skip=1 for the restore helper's caller (the longjmp wrapper) and
+ * skip=2 for the guest function that actually threw. */
+static void ppu_guest_caller_skip(char* out, size_t n, int skip)
+{
+    snprintf(out, n, "?");
+    void* fr[32]; unsigned short cnt = RtlCaptureStackBackTrace(0, 32, fr, 0);
+    int seen = 0;
+    for (unsigned short i = 0; i < cnt; i++) {
+        uintptr_t tgt = (uintptr_t)fr[i], best_h = 0; uint32_t best_g = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > best_h) { best_h = h; best_g = function_table[k].addr; }
+        }
+        if (best_g && tgt - best_h < 0x20000) {
+            if (seen++ < skip) continue;
+            snprintf(out, n, "func_%08X+0x%llX", best_g,
+                     (unsigned long long)(tgt - best_h));
+            return;
+        }
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * G4/G5 -- naming the guest function behind a fault
  *
@@ -952,9 +975,12 @@ extern "C" void ppu_report_guest_lrs(void)
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (!c) continue;
-        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
-                (unsigned)c->thread_id, (uint32_t)c->lr,
-                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+        { extern const char* ps3_hle_inflight_name(uint64_t tid);
+          const char* hle = ps3_hle_inflight_name(c->thread_id);
+          fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X cia=0x%08X r3=0x%08X r4=0x%08X sp=0x%08X %s%s\n",
+                  (unsigned)c->thread_id, (uint32_t)c->lr, (uint32_t)c->cia,
+                  (uint32_t)c->gpr[3], (uint32_t)c->gpr[4], (uint32_t)c->gpr[1],
+                  hle ? "hle=" : "", hle ? hle : ""); }
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
          * targets. lr cannot see those (bctrl does not write it), so for a
          * thread looping on a vtable call the ring is the only record of where
@@ -1660,6 +1686,13 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
     }
     if (s_lo < 0) return;
     if (a < (uint32_t)s_lo || a >= (uint32_t)s_lo + s_len) return;
+    static int64_t s_skip = -2;
+    if (s_skip == -2) {
+        const char* e = getenv("PPU_RWATCH_SKIP");
+        s_skip = e ? (int64_t)strtoul(e, 0, 16) : -1;
+    }
+    uint32_t g = ppu_prof_resolve_host(ra);
+    if (s_skip >= 0 && (int64_t)g == s_skip) return;
     static unsigned long rn;
     if (++rn <= 24 || (rn % 4096) == 0) {
         /* ...and the VALUE. PPU_WWATCH has always printed what was written;
@@ -1673,7 +1706,7 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
             v = __builtin_bswap32(t) >> ((4 - width) * 8);
         }
         fprintf(stderr, "[rwatch] n=%lu read%d 0x%08X = 0x%X guest-fn=0x%08X\n",
-                rn, width, a, v, ppu_prof_resolve_host(ra));
+                rn, width, a, v, g);
     }
     /* ...and the guest call chain on the first hit, as PPU_WWATCH does. The
      * sampled guest-fn is a HOST return address that identical code folding
@@ -1707,6 +1740,31 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     static int s_on = -1;
     if (s_on < 0) { const char* e = getenv("PS3_NULL_READ"); s_on = (e && *e == '0') ? 0 : 1; }
     if (!s_on) return;
+    /* The script/asset registry walk is the one that matters here: when it
+     * reaches a null child the map header says whether the tree was destroyed
+     * or merely had no such key.  Print it independently of the 16-line cap. */
+    if (g_active_ctx && (a == 0x19u || a == 0x10u || a == 0x8u)) {
+        static int _mn = 0;
+        if (_mn++ < 48) {
+            uint64_t m = 0x01721740ull;
+            uint32_t s = (uint32_t)g_active_ctx->gpr[4];
+            uint32_t p = s ? (unsigned)vm_read32(s) : 0;
+            char b[64]; int bi = 0;
+            if (p) for (; bi < 63; bi++) { uint8_t c = vm_read8(p + bi); if (!c) break; b[bi] = (char)c; }
+            b[bi] = 0;
+            fprintf(stderr, "[null-map] off=%02X root=%08X n4=%08X n8=%08X "
+                    "r3=%08X r4=%08X r5=%08X r28=%08X r29=%08X r30=%08X r31=%08X "
+                    "lr=%08X key=\"%s\" data=%08X\n",
+                    a, (unsigned)vm_read32(m + 0x74), (unsigned)vm_read32(m + 4),
+                    (unsigned)vm_read32(m + 8),
+                    (unsigned)g_active_ctx->gpr[3], (unsigned)g_active_ctx->gpr[4],
+                    (unsigned)g_active_ctx->gpr[5], (unsigned)g_active_ctx->gpr[28],
+                    (unsigned)g_active_ctx->gpr[29], (unsigned)g_active_ctx->gpr[30],
+                    (unsigned)g_active_ctx->gpr[31], (unsigned)g_active_ctx->lr,
+                    b, p);
+            fflush(stderr);
+        }
+    }
     static long s_n = 0;
     if (s_n++ >= 16) return;
     char where[288]; ppu_fault_where(where, sizeof where, ra);
@@ -2152,6 +2210,8 @@ void flow_lookup_alloc(unsigned int p) {
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
 
+/* The .inc is also compiled by test_ppu_setjmp_exec.py without this hook. */
+#define PPU_SJ_HOST_CALLER(o, n, skip) ppu_guest_caller_skip((o), (n), (skip))
 #include "ppu_setjmp.inc"
 
 /* Per-thread active guest context, for the crash handler to report the guest PC
@@ -2704,6 +2764,23 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * this file, and resolving runtime code through the lifted-function map
      * names an unrelated function, or nothing. */
     void* const ra = __builtin_return_address(0);
+    /* PS3_ICALL_RET_TO=<hex>: log the pre/post register state of one indirect
+     * call target, including the target's return value.  The script manager's
+     * run() entry is reached through a vtable, so this is the only way to see
+     * whether it returned a loaded script or a null "not found". */
+    { static int64_t rt = -2;
+      if (rt == -2) { const char* e = getenv("PS3_ICALL_RET_TO");
+                      rt = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (rt >= 0 && (uint32_t)ctx->ctr == (uint32_t)rt) {
+          const uint32_t a = (uint32_t)ctx->gpr[3], b = (uint32_t)ctx->gpr[4],
+                         c = (uint32_t)ctx->gpr[5], lr = (uint32_t)ctx->lr;
+          ps3_indirect_call_impl(ctx, ra);
+          fprintf(stderr, "[ICALLRET] tgt=0x%08X pre r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X -> ret r3=0x%08X r4=0x%08X r5=0x%08X\n",
+                  (uint32_t)rt, a, b, c, lr,
+                  (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
+          return;
+      }
+    }
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
@@ -2914,6 +2991,28 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
                   fprintf(stderr, "[null-call] tid=%u: further null calls not shown\n",
                           (unsigned)ctx->thread_id);
               if (s_n <= NC_PER) fflush(stderr); } }
+        /* PS3_NULLCALL_FATAL=1: stop at the FIRST null call with the full
+         * register set and guest stack. Continuing past a null pointer corrupts
+         * the caller's state (GT6's event worker exits), which buries the
+         * original fault under later damage. */
+        { static int s_fatal = -1;
+          static long s_fatal_tid = -2;
+          if (s_fatal < 0) s_fatal = getenv("PS3_NULLCALL_FATAL") ? 1 : 0;
+          if (s_fatal_tid == -2) {
+              const char* e = getenv("PS3_NULLCALL_FATAL_TID");
+              s_fatal_tid = (e && *e) ? atol(e) : -1;
+          }
+          if (s_fatal && (s_fatal_tid < 0 || (long)ctx->thread_id == s_fatal_tid)) {
+              fprintf(stderr, "[null-fatal] tid=%u lr=%08X\n",
+                      (unsigned)ctx->thread_id, (uint32_t)ctx->lr);
+              for (int i = 3; i <= 10; i++)
+                  fprintf(stderr, "[null-fatal] r%d=%08X\n", i, (uint32_t)ctx->gpr[i]);
+              ppu_dump_guest_stack(ctx, "null-fatal");
+              ppu_pc_ring_dump("null-fatal");
+              fflush(stderr);
+              exit(1);
+          }
+        }
         /* PPU_OPD_RECOVER=1: ctr==0 while r12 still points at a VALID OPD means
          * the lifted thunk failed to load the code word -- not that the function
          * pointer is genuinely null. We already read opd[0] for the diagnostic
@@ -3144,6 +3243,14 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
             ctx->gpr[3] = 0;
             return;
         }
+    }
+    if (getenv("PS3_NOOP_ALL_VCALL")) {
+        static int _an = 0;
+        if (_an++ < 24)
+            fprintf(stderr, "[ppu] noop-all-vcall -> 0x%08X this=0x%08X lr=0x%08X (returning 0)\n",
+                    (uint32_t)ctx->ctr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+        ctx->gpr[3] = 0;
+        return;
     }
     /* Stuck-loop guard: a divergence (e.g. an object with a null function
      * pointer) can make the game spin on the same unresolved target forever.
@@ -3492,7 +3599,16 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t wlen = len;
         if (wlen > 0x4000u) {   /* guard against garbage len (divergence dumps memory) */
             static int n = 0;
-            if (n < 20) { fprintf(stderr, "[tty] suspicious len=%u (buf=0x%08X) clamped\n", len, buf); n++; }
+            if (n < 20) {
+                fprintf(stderr, "[tty] suspicious len=%u (buf=0x%08X) ch=%u lr=0x%08X pc=0x%08X"
+                                " r3..r10=%08X %08X %08X %08X %08X %08X %08X %08X clamped\n",
+                        len, buf, ch, (unsigned)ctx->lr, (unsigned)ctx->cia,
+                        (unsigned)ctx->gpr[3], (unsigned)ctx->gpr[4],
+                        (unsigned)ctx->gpr[5], (unsigned)ctx->gpr[6],
+                        (unsigned)ctx->gpr[7], (unsigned)ctx->gpr[8],
+                        (unsigned)ctx->gpr[9], (unsigned)ctx->gpr[10]);
+                n++;
+            }
             wlen = 0x4000u;
         }
         /* Collapse a repeating line. A title that logs an error from inside a
@@ -3635,8 +3751,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             ULONGLONG _dt = GetTickCount64() - _t0;
             uint32_t _rv=(uint32_t)ctx->gpr[3];
             if (num < 1024) { s_acc[num]+=_dt; s_cnt[num]++; }
-            if (_dt >= 150 || (num==130 && _dt >= 8)) {
-                static int _bn=0; if (_bn++ < 40) {
+            { static int _bmin = -1;
+              if (_bmin < 0) { const char* e = getenv("PS3_SCBLOCK_MIN_MS");
+                               _bmin = e ? atoi(e) : 150; }
+              if (_dt >= (ULONGLONG)_bmin) {
+                static int _bn=0; if (_bn++ < 80) {
                 void* ra=__builtin_return_address(0);
                 uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
                 for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
@@ -3644,7 +3763,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     (unsigned long long)num,(unsigned long long)_dt,bg,(unsigned long long)(tgt-bh),
                     _a3,_a4,_a5,_rv,(unsigned)ctx->thread_id);
                 }
-            }
+              } }
             if (s_win==0) s_win=_t0;
             if (_t0 - s_win >= 2000) {
                 for (int n=0;n<1024;n++) if (s_acc[n]>=300)
@@ -4071,6 +4190,43 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     return ctx.gpr[3];
 }
 
+/* ---------------------------------------------------------------------------
+ * PS3_EXITSPAWN_MODE=soft: in-process guest reboot.
+ *
+ * A real sys_game_process_exitspawn2 starts a new process.  Recreating that
+ * faithfully would lose the PDI/SPURS state the first boot just built, so this
+ * diagnostic re-enters the ELF entry with the SAME VM image instead: the guest
+ * CRT/constructors run again, while the worker threads and PDI mount stay
+ * alive.  ppu_run arms this jump buffer on the main guest thread; a call from
+ * any other thread parks instead (a longjmp would cross thread stacks).
+ * -----------------------------------------------------------------------*/
+static jmp_buf s_guest_restart_jmp;
+static int     s_guest_restart_armed = 0;
+static uint64_t s_main_guest_tid = 0;
+extern "C" int g_guest_restart_requested = 0;
+extern "C" int g_soft_boot_no = 0;   /* 0 = first boot, >0 = soft relaunch */
+extern "C" uint64_t ppu_thread_register_main(void);
+
+extern "C" void ps3_request_guest_restart(ppu_context* ctx)
+{
+    /* g_active_ctx is THREAD-LOCAL, so comparing ctx==g_active_ctx matches on
+     * every guest thread.  A longjmp into the main thread's buffer from a
+     * worker would corrupt both stacks; require the main guest tid. */
+    if (ctx && s_main_guest_tid && ctx->thread_id == s_main_guest_tid && s_guest_restart_armed) {
+        g_guest_restart_requested = 1;
+        longjmp(s_guest_restart_jmp, 1);
+    }
+    fprintf(stderr, "[reboot] exitspawn from a non-main guest thread; parking it\n");
+    fflush(stderr);
+    for (;;) {
+#ifdef _WIN32
+        Sleep(1000);
+#else
+        sleep(1);
+#endif
+    }
+}
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
@@ -4085,18 +4241,39 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] entry code 0x%08X not registered\n", code); return -1; }
 
+    /* One identity for the process; a soft reboot keeps it (the real second
+     * process is again main tid 1). */
+    uint64_t main_tid = ppu_thread_register_main();
+    s_main_guest_tid = main_tid;
+    int boot_no = 0;
+    for (;;) {
+    g_soft_boot_no = boot_no;
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.gpr[1] = stack_top;   /* stack pointer */
-    ctx.gpr[2] = toc;         /* TOC base (r2) */
+
+    /* On a soft reboot, PS3_SOFTBOOT_MAIN=1 re-enters main (0x1096C) with the
+     * CRT/TLS/SPURS state already built instead of re-running _start.  The
+     * installer/PDI state in guest memory then survives the relaunch. */
+    uint32_t cur_code = code, cur_toc = toc;
+    ppu_fn   cur_fn   = fn;
+    { static int _sm = -1;
+      if (_sm < 0) _sm = getenv("PS3_SOFTBOOT_MAIN") ? 1 : 0;
+      if (_sm && boot_no > 0) {
+          uint32_t c2 = 0, t2 = 0;
+          if (ppu_opd_resolve(0x017FF000u, &c2, &t2) && c2) {
+              ppu_fn f2 = ppu_lookup(c2);
+              if (f2) { cur_code = c2; cur_toc = t2; cur_fn = f2; }
+          }
+      } }
+    ctx.gpr[2] = cur_toc;     /* TOC base (r2) */
 
     /* Unique nonzero identity for the main thread (thread-table slot 0, id 1).
      * With thread_id 0, main aliased the first created thread in sys_lwmutex's
      * owner stamps (0 -> LWM_TID collided with tid 1) and read as "free" in
      * sys_mutex -- LBP's main + bringup threads both held the GCM lock at once
      * and concurrently-emitted fences vanished (the boot-loading stall). */
-    { extern uint64_t ppu_thread_register_main(void);
-      ctx.thread_id = ppu_thread_register_main(); }
+    ctx.thread_id = main_tid;
 
     /* PS3 process-entry ABI: the loader hands _start register state the CRT
      * (_initialize) consumes directly:
@@ -4196,12 +4373,26 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
         }
         fprintf(stderr, "[ppu] argc=%u argv=0x%08X\n", argc_n, argv_base);
     }
-    fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
+    fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X, boot=%d\n",
+            cur_code, cur_toc, stack_top, boot_no);
     g_active_ctx = &ctx;
-    ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
-    fn(&ctx);
+    if (boot_no == 0) ppu_resv_register(&ctx);   /* main/entry thread */
+    if (setjmp(s_guest_restart_jmp) != 0) {
+        s_guest_restart_armed = 0;
+        g_guest_restart_requested = 0;
+        ++boot_no;
+        fprintf(stderr, "[reboot] soft reboot #%d: re-entering code 0x%08X with the VM image preserved\n",
+                boot_no, cur_code);
+        fflush(stderr);
+        if (boot_no >= 8) return 0;
+        continue;
+    }
+    s_guest_restart_armed = 1;
+    cur_fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    s_guest_restart_armed = 0;
     return 0;
+    }   /* for (;;) */
 }
 
 /* Resolve the current HOST call stack to guest functions via the lifted

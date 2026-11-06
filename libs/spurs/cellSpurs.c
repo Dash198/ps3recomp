@@ -697,6 +697,33 @@ s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads)
     return CELL_OK;
 }
 
+/* cellSpursGetSpuThreadId(spurs, thread, nThreads) -- 1.22 imports this.
+ * The reference API fills an array of SPU thread ids and the count.  This
+ * runtime models SPURS workloads with host threads, so there are no lv2 SPU
+ * thread ids to return; reporting the configured count and zero ids keeps the
+ * caller's size probe/invariant checks valid without inventing handles. */
+s32 cellSpursGetSpuThreadId(CellSpurs* spurs, u32* thread, u32* nThreads)
+{
+    if (!spurs)
+        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+
+    struct SpursInst* si = spurs_inst_find((u32)(uintptr_t)spurs);
+    if (!si)
+        return CELL_SPURS_CORE_ERROR_STAT;
+
+    if (nThreads)
+        vm_write32((u32)(uintptr_t)nThreads, si->nspus);
+
+    if (thread) {
+        for (u32 i = 0; i < si->nspus; i++)
+            vm_write32((u32)(uintptr_t)thread + i * 4, 0);
+    }
+
+    printf("[cellSpurs] GetSpuThreadId(spurs=0x%08X n=%u)\n",
+           si->ea, si->nspus);
+    return CELL_OK;
+}
+
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
                               u32 maxContention)
 {
@@ -1627,16 +1654,23 @@ struct spurs_pm_worker_arg {
     const uint8_t* pm; uint32_t pm_size;
     uint64_t arg; uint32_t wid, ea, spu_num;
 };
+/* SPURS_KERN_STAT counters (see the kernel dispatch loop). */
+static unsigned long g_kern_en, g_kern_state2, g_kern_disp;
+
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
+    g_kern_disp++;   /* SPURS_KERN_STAT: a policy-module dispatch actually ran */
     spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
                           a->arg, a->wid, a->ea, a->spu_num);
     return 0;
 }
+
+/* SPURS_KERN_STAT counters (see the kernel dispatch loop). */
+static unsigned long g_kern_en, g_kern_state2, g_kern_disp;
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
@@ -1666,6 +1700,28 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 
     for (;;) {
         Sleep(1);
+        {   /* SPURS_KERN_STAT=1: passes/sec + why the dispatch filter skips.
+             * The module is only dispatched ~8-10 times per 30-60 s even though
+             * this loop wakes every 1 ms, so the pass counter tells us whether
+             * the loop itself is starved (host scheduling) or the filters are
+             * rejecting the instance/workload. */
+            static int _st = -1; static unsigned long _pass, _disp;
+            static unsigned long long _t0;
+            if (_st < 0) _st = getenv("SPURS_KERN_STAT") ? 1 : 0;
+            if (_st) {
+                _pass++;
+                unsigned long long now = (unsigned long long)GetTickCount64();
+                if (!_t0) _t0 = now;
+                if (now - _t0 >= 5000) {
+                    fprintf(stderr, "[kern-stat] \"%s\" passes=%lu enabled=%lu "
+                            "state2=%lu dispatched=%lu over %llums\n",
+                            si->prefix, _pass, g_kern_en, g_kern_state2, _disp,
+                            (unsigned long long)(now - _t0));
+                    fflush(stderr);
+                    _pass = _disp = 0; g_kern_en = g_kern_state2 = 0; _t0 = now;
+                }
+            }
+        }
         u32 ea = si->ea;
         if (!ea || s_pm_off) continue;
 
@@ -1711,11 +1767,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             }
         }
         if (!enabled) continue;
+        g_kern_en++;
 
         for (u32 wid = 0; wid < 16; wid++) {
             if (!(enabled & (0x80000000u >> wid))) continue;
             if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) continue;
             if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
+            g_kern_state2++;
 
             /* A SPURS policy module is a PERSISTENT SPU program. The real kernel
              * schedules an ENABLED, runnable workload onto an SPU and the module
@@ -1737,10 +1795,31 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
             u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
             int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
-            if (*rdy) (*rdy)--;
-            if (sig & (0x8000u >> wid))
-                vm_write32(ea + SPURS_WKL_SIGNAL1,
-                           (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
+            {   /* A producer push (cellSpurs.c callers publish entries through the
+                 * lifted 0x00B327DC) counts as a kick: run this workload's module
+                 * on the very next pass instead of waiting for the periodic
+                 * dispatch, so the entry is still in the ring when the module
+                 * looks. Without this the module and the producer never overlap. */
+                extern volatile unsigned g_spurs_push_seq;
+                static unsigned s_last_push;
+                if (g_spurs_push_seq != s_last_push) {
+                    s_last_push = g_spurs_push_seq;
+                    kicked = 1;
+                }
+            }
+            {   /* PS3_SPURS_KEEP_READY=1: do not consume the kick before the
+                 * run. GT6's PM exits via its "no work" path (LS 0x12A0 == 0)
+                 * even while the PPU's queue has entries; this A/B says whether
+                 * the PM checks the instance ready/signal itself. */
+                static int _kr = -1;
+                if (_kr < 0) _kr = getenv("PS3_SPURS_KEEP_READY") ? 1 : 0;
+                if (!_kr) {
+                    if (*rdy) (*rdy)--;
+                    if (sig & (0x8000u >> wid))
+                        vm_write32(ea + SPURS_WKL_SIGNAL1,
+                                   (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
+                }
+            }
 
             WklPm* r = spurs_resolve_pm(wid);
             if (!r) continue;
@@ -1758,6 +1837,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (wid == 0) s_pass_no++;
                 if (kicked) s_idle[wid] = 0;
                 u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
+                /* PS3_SPURS_NO_IDLE_BACKOFF=1: run every enabled workload every
+                 * pass. GT6's PDI workload is fed by a producer whose entries
+                 * appear only intermittently; at a 1-in-16 cadence the module
+                 * runs *between* publications and always observes an empty ring
+                 * (42 policy runs, zero ever saw a non-zero entry array, while
+                 * the PPU's own probe saw entries 16 times in the same run).
+                 * Staying at cadence 1 makes the module look at the ring every
+                 * pass, which is also what the real kernel's dispatch loop does
+                 * for a runnable workload. */
+                static int s_nob = -1;
+                if (s_nob < 0) s_nob = getenv("PS3_SPURS_NO_IDLE_BACKOFF") ? 1 : 0;
+                if (s_nob) cad = 1;
                 if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
                 extern volatile unsigned g_spurs_pm_polls;
                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
@@ -1806,6 +1897,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 s_fs = e ? atoi(e) : -1; }
               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
+            g_kern_disp++;   /* SPURS_KERN_STAT: a workload actually reached dispatch */
             {
                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
                 uint32_t sz = s_workloads[wid].sizePm;
@@ -2764,14 +2856,18 @@ static int spurs_job_index_on(void)
     return v;
 }
 
-static void jc_signal_done(u32 jc_ea, int advance)
+static void jc_signal_done(u32 jc_ea, int advance, u32 job_index)
 {
     int slot = jc_slot_by_ea(jc_ea);
-    u32 job_index = 0;
-    if (slot >= 0 && spurs_job_index_on())
-        job_index = (u32)(advance
-                          ? jc_atomic_inc(&s_jobchains[slot].jobs_done) - 1
-                          : jc_atomic_load(&s_jobchains[slot].jobs_done));
+    (void)advance;
+    /* data2 is the index of the completed job *within the current walk*
+     * (0..maxGrab-1). GT6's chain has maxGrab=16 and its event loop uses
+     * data2 to pick one of a 16-entry callback table; a lifetime-cumulative
+     * counter reaches 16+ after the second batch, indexes past the table and
+     * calls whatever memory follows (observed: thread objects, 1/4/0x10,
+     * 0xFFFF -- the "938 indirect calls to data"). Reset semantics are the
+     * walker's, not the chain's, so the counter is passed in by jc_execute. */
+    if (!spurs_job_index_on()) job_index = 0;
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
      * synthetic payload means the caller reads back zero for whatever it
@@ -2875,7 +2971,15 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, int slot)
              * and sat in event_queue_receive 30 times -- so batching the
              * completion into one event per pass leaves it waiting for
              * completions that, from its point of view, never arrive. */
-            jc_signal_done(jc_ea, 1);
+            {   /* The completion index is per GRAB, not per lifetime: the PPU
+                 * dispatches it into a table of `maxGrab` (GT6: 16) callbacks.
+                 * A long service-loop walk runs far more jobs than one grab,
+                 * so wrap at maxGrab -- sending 16+ indexes past the table
+                 * (observed: 938 calls into data). */
+                u32 grab = s_jobchains[slot].max_grab;
+                if (!grab || grab > 16) grab = 16;
+                jc_signal_done(jc_ea, 1, (u32)((jobs - 1) % grab));
+            }
             pc += 8; continue;
         }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
@@ -2884,7 +2988,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, int slot)
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
                 printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
-                if (jobs) jc_signal_done(jc_ea, 0);
+                if (jobs) jc_signal_done(jc_ea, 0, (u32)(jobs - 1));
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
@@ -2935,7 +3039,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
         /* Tell the application the chain is done. Without this the walk
          * finishes in silence and a thread waiting on the attached queue
          * never runs again. */
-        jc_signal_done(s_jobchains[slot].jc_ea, 0);
+        jc_signal_done(s_jobchains[slot].jc_ea, 0, 0);
     }
     /* Publish completion BEFORE clearing alive: a joiner that sees alive==0
      * must also see this generation's done_generation. */
@@ -3336,6 +3440,14 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 
     if (!spurs_ea || !info_ea)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+
+    /* Clear the guest out-struct BEFORE validating wid.  The guest pollers
+     * (e.g. func_00B32150) read readyCount/contention and ignore the error
+     * return; if we leave the previous stack contents here they poll forever
+     * on a workload this HLE never registered (GT6 hits wid=6 during the
+     * 13FD0 teardown when the patched 1.22 module is served). */
+    for (u32 o = 0; o < 0x30; o += 4) vm_write32((u32)info_ea + o, 0);
+
     if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use)
         return CELL_SPURS_CORE_ERROR_INVAL;
 
@@ -3364,6 +3476,20 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     *(vm_base + base + 0x24) = *(vm_base + se + SPURS_WKL_IDLE2  + wid);   /* idleSpuRequest */
     u32 sig = vm_read32(se + SPURS_WKL_SIGNAL1) >> 16;
     *(vm_base + base + 0x25) = (sig & (0x8000u >> wid)) ? 1 : 0;           /* hasSignal    */
+    {   /* PS3_WKLDBG=1: the guest's job-submit path spins until readyCount==0
+         * and contention==0 (probe func_00B31F50 -> this). If a workload is
+         * never idle, this names which field is stuck. */
+        static int _d = -1; static int _n = 0;
+        if (_d < 0) _d = getenv("PS3_WKLDBG") ? 1 : 0;
+        if (_d && _n++ < 40)
+            fprintf(stderr, "[wklinfo] spurs=%08X wid=%u data=%08X curcont=%u ready=%u "
+                    "min=%u max=%u idle=%u sig=%04X\n",
+                    se, wid, (u32)w->data,
+                    (unsigned)*(vm_base + base + 0x20),
+                    (unsigned)*(vm_base + base + 0x23),
+                    (unsigned)w->minContention, (unsigned)w->maxContention,
+                    (unsigned)*(vm_base + base + 0x24), (unsigned)sig);
+    }
     return CELL_OK;
 }
 

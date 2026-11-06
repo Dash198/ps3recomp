@@ -208,6 +208,14 @@ static void gcm_update_handler_mask(void)
     if (s_vblank_handler_opd) m |= 0x02;
     if (s_flip_handler_opd)   m |= 0x04;
     if (s_user_handler_opd)   m |= 0x80;
+    /* The runner never assigned this (the comment claimed it did), so the
+     * mask was never published and sys_rsx read 0 -- every GCM user command
+     * was filtered out, and the flip path parked waiting for the event. The
+     * runtime's RsxDriverInfo page lives at VM_HLE_INJECT_BASE + 0x31000
+     * (see sys_rsx.c RSX_DRIVER_INFO_EA); +0x12C0 is its handler mask. */
+    if (!g_gcm_driver_info_ea)
+        g_gcm_driver_info_ea = VM_HLE_INJECT_BASE + 0x31000u;
+    { extern void rsx_ensure_isr_queue(void); rsx_ensure_isr_queue(); }
     g_gcm_handler_mask = m;
     if (g_gcm_driver_info_ea)
         vm_write32(g_gcm_driver_info_ea + 0x12C0, m);
@@ -326,6 +334,15 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
     u32 pages = (size + 0xFFFFFu) >> 20;  /* number of 1MB pages, rounded up */
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
+
+    /* The driver's own FIFO window (IO page 0) must never be re-pointed: see
+     * gcm_io2ea. Log it if a mapping tries, so the caller can be found. */
+    if (io_page == 0 || ea_page == 0) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[cellGcmSys] offset-table page 0: ea=0x%08X io=0x%08X size=0x%X\n",
+                    ea, io, size);
+    }
 
     for (u32 i = 0; i < pages && (ea_page + i) < 65536 && (io_page + i) < 65536; i++) {
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
@@ -453,6 +470,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     /* Set up the initial IO mapping for the command buffer region */
     if (ioAddress != 0 && ioSize > 0) {
         populate_offset_table(ioAddress, 0, ioSize);
+        fprintf(stderr, "[GCM] init io=0x%08X ioSize=0x%X table0=0x%04X (ea_page 0x%X)\n",
+                ioAddress, ioSize, s_ea_address_table[0], ioAddress >> 20);
 
         s_io_mappings[0].ea     = ioAddress;
         s_io_mappings[0].io     = 0;
@@ -747,6 +766,14 @@ void cellGcmTickFlip(void)
  * populated by cellGcmInit / cellGcmMapMainMemory / MapEaIoAddress). */
 static u32 gcm_io2ea(u32 io)
 {
+    /* The IO region cellGcmInit created (io 0 .. ioSize) belongs to the
+     * driver's own command buffer: io 0 is its EA base. Nothing the title
+     * maps may re-point it. A stray mapping that landed on IO page 0 used to
+     * replace it with EA page 0, so the walker read the game's ELF image at
+     * EA 0x10000+ instead of the FIFO -- it "decoded" PPC code as commands,
+     * ran millions of words past `put`, and never produced a second frame. */
+    if (s_config.ioAddress && s_config.ioSize && io < s_config.ioSize)
+        return s_config.ioAddress + io;
     u32 page = io >> 20;
     if (page >= 65536) return 0;
     u16 ea_page = s_ea_address_table[page];
@@ -781,7 +808,23 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
 static u32 s_fifo_getoff  = 0;
 static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
+/* GCM command streams nest: the ring CALLs a display list, and that list may
+ * CALL another. A single return slot lost the outer frame's return address the
+ * moment the second CALL overwrote it, after which the walker wandered out of
+ * the list and circled the whole 256 MB IO space until the budget ran out.
+ * Keep a real (small) return stack. */
+#define GCM_FIFO_CALLSTACK 16
+static u32 s_fifo_callstack[GCM_FIFO_CALLSTACK];
+static int s_fifo_calldepth = 0;
 static u32 s_fifo_calloff = 0;
+/* The last JUMP that left the submitted part of the ring (target > put) and
+ * the word it was taken from. If the jumped-to body never finds a way back
+ * (a display list whose tail the title has not finished writing, or one we
+ * cannot decode), the drain resumes after this JUMP instead of resyncing to
+ * put -- resyncing throws away every command still in the ring, which is
+ * where that frame's fence and flip live. */
+static u32 s_fifo_jump_off = 0;
+static u32 s_fifo_jump_tgt = 0;
 
 /* ---------------------------------------------------------------------------
  * 2D transfer engines (FIFO subchannels != 0).
@@ -1316,6 +1359,12 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
                     " 0x%08X..0x%08X\n", rescued, from, land); }
     }
     *getoff = land;
+    /* A resync abandons the stream mid-CALL as often as not; keep no stale
+     * return frames from a buffer we are no longer walking. */
+    s_fifo_calldepth = 0;
+    s_fifo_calloff = 0;
+    s_fifo_jump_off = 0;
+    s_fifo_jump_tgt = 0;
 }
 
 static void gcm_fifo_dump_around(u32 getoff)
@@ -1468,6 +1517,37 @@ void cellGcm_rsx_process_fifo(void)
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    /* GCM_DUMP_AT=<io offset> (and GCM_DUMP_AT2): one-shot hex dump of guest
+     * memory through the IO map, for comparing a command list against the copy
+     * the title relocated. GCM_DUMP_LEN=<words> (default 64). */
+    { static int done = 0;
+      const char* mp = getenv("GCM_DUMP_PUT");
+      u32 need = (mp && *mp) ? (u32)strtoul(mp, NULL, 0) : 1u;
+      if (!done && ((s_config.ioAddress != 0 &&
+                     vm_read32(GCM_CONTROL_GUEST_ADDR) >= need) ||
+                    getenv("GCM_DUMP_EARLY"))) {
+          const char* a = getenv("GCM_DUMP_AT");
+          const char* b = getenv("GCM_DUMP_AT2");
+          if (a || b) {
+              const char* l = getenv("GCM_DUMP_LEN");
+              int n = l ? atoi(l) : 64;
+              if (n <= 0 || n > 4096) n = 64;
+              for (int pass = 0; pass < 2; pass++) {
+                  const char* s = pass ? b : a;
+                  if (!s || !*s) continue;
+                  u32 off = (u32)strtoul(s, NULL, 0);
+                  for (int i = 0; i < n; i++) {
+                      u32 o = off + (u32)i * 4u, ea = gcm_io2ea(o);
+                      if (!ea) { fprintf(stderr, "[DUMP] %08X unmapped\n", o); break; }
+                      if ((i & 7) == 0) fprintf(stderr, "[DUMP] io=%08X ea=%08X:", o, ea);
+                      fprintf(stderr, " %08X", vm_read32(ea));
+                      if ((i & 7) == 7) fprintf(stderr, "\n");
+                  }
+                  fprintf(stderr, "\n");
+              }
+              done = 1;
+          }
+      } }
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -1659,42 +1739,125 @@ static void gcm_rsx_process_fifo_unlocked(void)
             continue;
         }
 
-        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+        if (type == 1) {                       /* JUMP or CALL */
+            /* 0x20000000 = JUMP, 0x30000000 = CALL. Both have the same top
+             * three bits, so (w >> 29) cannot distinguish them; bit 28 is the
+             * CALL flag. Treating a CALL as a JUMP produced a 29-bit target
+             * with bit 28 set (e.g. 0x31368080 -> "JUMP" 0x11368080), which is
+             * never IO-mapped, so the drain resynced and lost the stream. */
+            int is_call = (w & 0x10000000u) != 0;
+            u32 tgt = w & (is_call ? 0x0FFFFFFCu : 0x1FFFFFFCu);
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
-              if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
-                               s_fifo_getoff, w & 0x1FFFFFFCu, put); }
-            { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
-              /* A JUMP to its own address is the "park the RSX here" idiom:
-               * the title leaves it at the write head so the GPU stops if it
-               * catches up, and overwrites it when the next segment is
-               * appended. Taking it re-reads the same word forever -- 38.8 M
-               * times in one Twisted Metal run, which is the drain burning the
-               * CPU the guest needs. Stop this pass instead; the next one
-               * re-reads the word, so a patched jump is still followed. */
-              if (tgt == s_fifo_getoff) {
-                  /* Parked. If the title has meanwhile moved `put` somewhere
-                   * else, it has switched to its other segment and left this
-                   * park standing -- it only patches a park when it reuses that
-                   * block. Waiting for a patch that will not come freezes the
-                   * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
-                  break;
-              }
-              s_fifo_getoff = tgt; }
+              if (_rd) fprintf(stderr, "[%s] %08X -> %08X (put=%08X)\n",
+                               is_call ? "CALL" : "JMP", s_fifo_getoff, tgt, put); }
+            if (!gcm_io2ea(tgt)) {
+                gcm_fifo_bad_branch(is_call ? "CALL" : "JUMP", tgt, w);
+                gcm_fifo_dump_around(s_fifo_getoff);
+                gcm_fifo_resync_why(is_call ? "unmapped-CALL" : "unmapped-JUMP",
+                                    &s_fifo_getoff, put);
+                break;
+            }
+            if (is_call) {
+                if (s_fifo_calldepth < GCM_FIFO_CALLSTACK) {
+                    s_fifo_callstack[s_fifo_calldepth++] = s_fifo_getoff + 4;
+                    s_fifo_calloff = s_fifo_getoff + 4;
+                    s_fifo_getoff  = tgt;
+                } else {
+                    /* Deeper than any real GCM stream: the walker is looping
+                     * through CALLs rather than returning. Drop the outermost
+                     * frame and say so; the next RET will unwind. */
+                    static int _ov = 0;
+                    if (_ov++ < 4)
+                        fprintf(stderr, "[cellGcmSys] FIFO CALL stack overflow at "
+                                "0x%08X -> 0x%08X -- unwinding\n", s_fifo_getoff, tgt);
+                    s_fifo_getoff = s_fifo_callstack[0];
+                    s_fifo_calldepth = 0;
+                }
+                { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? atoi(getenv("GCM_RECDBG")) : 0;
+                  if (_rd >= 2) {
+                      fprintf(stderr, "[CALLBODY] %08X:", tgt);
+                      for (int k = 0; k < 12; k++) {
+                          u32 _e = gcm_io2ea(tgt + (u32)k * 4u);
+                          fprintf(stderr, " %08X", _e ? vm_read32(_e) : 0xDEADBEEFu);
+                      }
+                      fprintf(stderr, " depth=%d\n", s_fifo_calldepth);
+                  } }
+                continue;
+            }
+            /* A JUMP to its own address is the "park the RSX here" idiom:
+             * the title leaves it at the write head so the GPU stops if it
+             * catches up, and overwrites it when the next segment is
+             * appended. Taking it re-reads the same word forever -- 38.8 M
+             * times in one Twisted Metal run, which is the drain burning the
+             * CPU the guest needs. Stop this pass instead; the next one
+             * re-reads the word, so a patched jump is still followed. */
+            if (tgt == s_fifo_getoff) {
+                /* Parked. If the title has meanwhile moved `put` somewhere
+                 * else, it has switched to its other segment and left this
+                 * park standing -- it only patches a park when it reuses that
+                 * block. Waiting for a patch that will not come freezes the
+                 * FIFO for the rest of the run, so follow the write head. */
+                if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
+                                            gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                break;
+            }
+            /* Experimental: PS3_GCM_NO_FOLLOW_JUMPS=1 skips a JUMP out of the
+             * submitted ring instead of following it. Diagnostic for deciding
+             * whether a frame's fences/flips live in the ring (they do for GT6)
+             * or only inside the jumped-to list. */
+            if (tgt > put) {
+                static int nf = -1;
+                if (nf < 0) {
+                    const char* e = getenv("PS3_GCM_NO_FOLLOW_JUMPS");
+                    nf = (e && *e && *e != '0') ? 1 : 0;
+                }
+                if (nf) {
+                    static int nn = 0;
+                    if (nn++ < 8)
+                        fprintf(stderr, "[cellGcmSys] FIFO JUMP 0x%08X -> 0x%08X "
+                                "skipped (PS3_GCM_NO_FOLLOW_JUMPS), continuing "
+                                "after it\n", s_fifo_getoff, tgt);
+                    s_fifo_getoff += 4;
+                    continue;
+                }
+            }
+            /* Leaving the submitted part of the ring: remember where, so a
+             * body we cannot finish does not cost us the rest of the ring. */
+            if (tgt > put) { s_fifo_jump_off = s_fifo_getoff; s_fifo_jump_tgt = tgt; }
+            else           { s_fifo_jump_off = 0; }
+            s_fifo_getoff = tgt;
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
-              s_fifo_calloff = s_fifo_getoff + 4;
-              s_fifo_getoff  = tgt; }
+              if (s_fifo_calldepth < GCM_FIFO_CALLSTACK) {
+                  s_fifo_callstack[s_fifo_calldepth++] = s_fifo_getoff + 4;
+                  s_fifo_calloff = s_fifo_getoff + 4;
+                  s_fifo_getoff  = tgt;
+              } else {
+                  s_fifo_getoff = s_fifo_callstack[0];
+                  s_fifo_calldepth = 0;
+              } }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
-            s_fifo_getoff = s_fifo_calloff;
-            s_fifo_calloff = 0;
+            if (s_fifo_calldepth > 0) {
+                s_fifo_getoff = s_fifo_callstack[--s_fifo_calldepth];
+                s_fifo_calloff = s_fifo_calldepth ? s_fifo_callstack[s_fifo_calldepth - 1] : 0;
+                if (s_fifo_getoff < put) s_fifo_jump_off = 0;   /* back in the ring */
+            } else {
+                /* Stray RET: a JUMP-entered list (no return address) still ends
+                 * with one. Skipping it instead of jumping to 0 keeps the walk
+                 * moving toward `put`; a RET with an empty stack cannot be
+                 * honoured either way. */
+                s_fifo_getoff += 4;
+            }
+            { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? atoi(getenv("GCM_RECDBG")) : 0;
+              static long long _nr = 0;
+              if (_rd >= 2 && _nr++ < 40)
+                  fprintf(stderr, "[RET] from %08X -> %08X depth=%d\n",
+                          s_fifo_getoff, s_fifo_calloff, s_fifo_calldepth); }
             continue;
         }
         if (type == 0 || type == 2) {          /* method (incrementing / NI) */
@@ -1775,7 +1938,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
-                    rsx_raise_user_cmd(vm_read32(dea));
+                    u32 uc = vm_read32(dea);
+                    rsx_raise_user_cmd(uc);
+                    /* The handler cellGcmSetUserHandler registered is a GUEST
+                     * OPD; this runtime dispatches it from ppu_gcm_pump, so the
+                     * command must be queued for pump delivery as well as the
+                     * raw lv2-style event posted above.  Without this, GT6's
+                     * user handler (which clears the GCM completion event and
+                     * signals its waiter) never runs: the FIFO executes one
+                     * SET_USER_COMMAND per frame with arg 0, the event lands on
+                     * the synthetic ISR queue that no guest thread receives,
+                     * and every frame pays a 5 s sys_cond_wait timeout. */
+                    cellGcmQueueUserCommand(uc);
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -1899,11 +2073,39 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
             }
+            /* GCM_SKIPDBG=1: flag method blocks whose data window contains a
+             * control word (RET / JUMP / CALL). If the block count is right,
+             * those words are just data; if the count is wrong, this is exactly
+             * how the walker steps over the list's terminating branch and runs
+             * into unrelated memory. */
+            { static int sd = -1; static long long sn = 0;
+              if (sd < 0) sd = getenv("GCM_SKIPDBG") ? 1 : 0;
+              if (sd && sn < 40) {
+                  u32 lim = count > 64u ? 64u : count;
+                  for (u32 i = 0; i < lim; i++) {
+                      u32 o = s_fifo_getoff + 4 + i * 4;
+                      u32 e2 = gcm_io2ea(o); if (!e2) break;
+                      u32 v = vm_read32(e2);
+                      if (v == 0x00020000u || (v & 0xE0000000u) == 0x20000000u) {
+                          sn++;
+                          fprintf(stderr, "[SKIP] block 0x%08X m=0x%04X n=%u skips "
+                                  "control word 0x%08X at 0x%08X (block ends 0x%08X)\n",
+                                  s_fifo_getoff, method, count, v, o,
+                                  s_fifo_getoff + 4 + count * 4);
+                          break;
+                      }
+                  }
+              } }
             s_fifo_getoff += 4 + count * 4;
             continue;
         }
         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+        { static int _ud = -1; static int _un = 0;
+          if (_ud < 0) _ud = getenv("GCM_RECDBG") ? atoi(getenv("GCM_RECDBG")) : 0;
+          if (_ud >= 1 && _un++ < 24)
+              fprintf(stderr, "[FIFOUW] unknown word 0x%08X at 0x%08X put=0x%08X\n",
+                      w, s_fifo_getoff, put); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
@@ -1935,7 +2137,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
     { static int burned = 0, passes = -1;
       if (passes < 0) { const char* e = getenv("GCM_FIFO_CIRCLE_PASSES");
                         passes = e ? atoi(e) : 4; }
-      if (passes && budget <= 0 && s_fifo_getoff != put) {
+      if (budget <= 0 && s_fifo_getoff != put && s_fifo_jump_off &&
+          s_fifo_getoff != s_fifo_jump_off) {
+          /* A JUMP left the ring and its body never returned. Resume after
+           * the JUMP instead of resyncing to put: the commands between there
+           * and put (fences, flips) are still in the ring and are what this
+           * frame needs. */
+          static int jn = 0;
+          if (jn++ < 8)
+              fprintf(stderr, "[cellGcmSys] FIFO JUMP 0x%08X -> 0x%08X did not "
+                      "return; resuming after the JUMP at 0x%08X\n",
+                      s_fifo_jump_off, s_fifo_jump_tgt, s_fifo_jump_off + 4);
+          s_fifo_getoff = s_fifo_jump_off + 4;
+          s_fifo_jump_off = 0;
+          s_fifo_calldepth = 0;
+          burned = 0;
+      } else if (passes && budget <= 0 && s_fifo_getoff != put) {
           if (++burned >= passes) {
               static int n = 0;
               if (n++ < 8)
@@ -1946,6 +2163,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
               burned = 0;
           }
       } else burned = 0; }
+
+    if (s_fifo_getoff == put) s_fifo_jump_off = 0;   /* arrived */
 
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
       if (s_fifo_getoff == last && s_fifo_getoff != put) {
@@ -2075,6 +2294,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
  * (~200 frames at the 256KB default), which looked like a GPU/driver hang. */
 static u32 gcm_ea2io(u32 ea)
 {
+    /* Symmetric with gcm_io2ea: the driver's own IO region always converts
+     * back to its offset, regardless of what the page table currently says. */
+    if (s_config.ioAddress && s_config.ioSize &&
+        ea >= s_config.ioAddress && ea - s_config.ioAddress < s_config.ioSize)
+        return ea - s_config.ioAddress;
     u32 page = ea >> 20;
     if (page >= 65536) return 0xFFFFFFFFu;
     u16 io_page = s_io_address_table[page];
@@ -2331,6 +2555,21 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
     (void)ctx;  /* command buffer context -- not used in HLE */
+    {   /* PS3_FLIP_TID=1: name the guest thread that produces frames.  The
+         * 1.00/1.22 hybrid boot can leave the app main thread in teardown while
+         * worker threads keep flipping, so "which tid flips" is the difference
+         * between a live app loop and drain-only rendering. */
+        static int _d = -1;
+        if (_d < 0) _d = getenv("PS3_FLIP_TID") ? 1 : 0;
+        if (_d) {
+            static int _n = 0;
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            if (_n++ < 12 && g_active_ctx)
+                fprintf(stderr, "[flip-tid] tid=%llu lr=%08X\n",
+                        (unsigned long long)g_active_ctx->thread_id,
+                        (unsigned)g_active_ctx->lr);
+        }
+    }
 
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
@@ -2341,7 +2580,13 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
 
     s_current_display_buffer_id = bufferId;
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    /* A prepare-flip is a real flip request: mark it pending so the ticker
+     * presents BEFORE the next drain, and WAITING so cellGcmTickFlip delivers
+     * the completion. Setting DONE here (the old behavior) meant the ticker
+     * never presented and TickFlip never ran -- GCM registered, SetPrepareFlip
+     * counted, but no frame ever reached the backend. */
+    s_flip_pending = 1;
+    s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
@@ -3423,6 +3668,7 @@ u32 cellGcm_syscall_bringup(u32 local_size)
     if (local_size)
         s_config.localSize = local_size;
     s_gcm_syscall_mode = 1;
+    { extern void rsx_ensure_isr_queue(void); rsx_ensure_isr_queue(); }
     return s_config.localAddress;
 }
 

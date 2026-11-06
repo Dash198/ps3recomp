@@ -241,6 +241,17 @@ void spu_irq_regs_forget(spu_context* ctx)
 
 int spu_irq_regs_maybe_restore(spu_context* ctx)
 {
+    {   /* PS3_IRQDBG3=1: this is called on every dispatch; log the state it
+         * inspects, to see whether the enable survives to a dispatch. */
+        static int _d3 = -1;
+        if (_d3 < 0) _d3 = getenv("PS3_IRQDBG3") ? 1 : 0;
+        if (_d3 && ctx->policy_mode) {
+            static int _n = 0;
+            if ((ctx->pc & SPU_LS_MASK) == 0x2D30u && _n++ < 12)
+                fprintf(stderr, "[irqdbg3] dispatch pc=02D30 ie=%d saved=%d srr0=%05X\n",
+                        ctx->int_enable, ctx->irq_saved, ctx->srr0 & SPU_LS_MASK);
+        }
+    }
     {
         if (ctx->irq_saved) {
             if ((ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
@@ -418,6 +429,43 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
             spu_task_launch_check(ctx, (void*)fn);
+            {   /* PS3_SPU_IRQ_FORCE=1: the policy module never sets the SPU
+                 * interrupt-enable bit anywhere in its image (no E-bit wrch and
+                 * no E-bit branch), yet the stall-and-notify contract requires
+                 * it to enter a handler to issue MFC_WrListStallAck. Force the
+                 * SN interrupt (event bit 0x2 only) so we can observe whether
+                 * the handler path vectors and acks at all. */
+                static int _f = -1;
+                if (_f < 0) _f = getenv("PS3_SPU_IRQ_FORCE") ? 1 : 0;
+                if (_f && ctx->policy_mode && (ctx->event_status & 0x2u))
+                    ctx->int_enable = 1;
+            }
+            {   /* PS3_IRQDBG=1: one-shot view of the three terms spu_take_interrupt
+                 * gates on, plus the LS-0 vector word, for the policy module.
+                 * Decides whether the module blocks on a consumed event, a mask
+                 * that is not 0x2, or a missing/!bra vector at LS 0. */
+                static int _id = -1;
+                if (_id < 0) _id = getenv("PS3_IRQDBG") ? 1 : 0;
+                if (_id && ctx->policy_mode) {
+                    static int _n = 0;
+                    /* Only log when something is actually pending: the first 24
+                     * hook hits are all pre-stall (ev=0, parked=0), so an
+                     * unconditional cap hides the interesting moment. */
+                    if ((ctx->int_enable || ctx->list_stall_mask ||
+                         ctx->list_stall_stat || ctx->event_status) && _n++ < 200) {
+                        const uint8_t* v = ctx->ls;
+                        uint32_t w0 = ((uint32_t)v[0] << 24) | ((uint32_t)v[1] << 16) |
+                                      ((uint32_t)v[2] << 8) | v[3];
+                        fprintf(stderr, "[irqdbg] img=%d pc=%05X ev=0x%X mask=0x%X "
+                                "ie=%d parked=0x%X stallstat=0x%X LS0=%08X op9=%03X\n",
+                                ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                                ctx->event_status, ctx->event_mask, ctx->int_enable,
+                                ctx->list_stall_mask, ctx->list_stall_stat, w0,
+                                (w0 >> 23) & 0x1FF);
+                        fflush(stderr);
+                    }
+                }
+            }
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

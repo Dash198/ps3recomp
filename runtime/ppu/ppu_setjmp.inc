@@ -49,6 +49,25 @@ static int ppu_sj_trace(void)
     return on;
 }
 
+/* PS3_SJ_TRACE_TID=<n>: only trace arm/jump events on that guest thread.
+ * A busy retry loop can otherwise consume the trace's line budget before the
+ * thread under investigation ever arms its guard. */
+static int ppu_sj_trace_tid(void)
+{
+    static int tid = -1;
+    if (tid < 0) {
+        const char* e = getenv("PS3_SJ_TRACE_TID");
+        tid = e ? atoi(e) : 0;
+    }
+    return tid;
+}
+
+static int ppu_sj_trace_this(ppu_context* ctx)
+{
+    const int t = ppu_sj_trace_tid();
+    return ppu_sj_trace() && (t == 0 || (int)ctx->thread_id == t);
+}
+
 /* Arm (or re-arm) the pad for a guest block and hand back its host jmp_buf. The
  * caller -- the generated PPU_SETJMP_GUARD -- runs setjmp on it in its own
  * frame, then calls the save helper. */
@@ -77,7 +96,7 @@ extern "C" jmp_buf* ppu_sj_slot(ppu_context* ctx, uint64_t blk)
      * remember the values the unwound frames would have restored. */
     s->vcsp = g_vcall_sp;
     s->vcdepth = g_vcall_depth;
-    if (ppu_sj_trace()) {
+    if (ppu_sj_trace_this(ctx)) {
         static int _n = 0;
         if (_n++ < 40)
             fprintf(stderr, "[sj] arm  blk=0x%08X sp=0x%08X tid=%llu\n", b,
@@ -106,13 +125,30 @@ extern "C" void ppu_lj_do(ppu_context* ctx, uint64_t blk, uint64_t cur_sp)
                         b, (uint32_t)saved_sp, (uint32_t)cur_sp);
             return;
         }
-        if (ppu_sj_trace()) {
+        if (ppu_sj_trace_this(ctx)) {
             static int _n = 0;
-            if (_n++ < 40)
+            if (_n++ < 40) {
+#ifdef PPU_SJ_HOST_CALLER
+                char c1[64], c2[64], c3[64];
+                PPU_SJ_HOST_CALLER(c1, sizeof c1, 1);
+                PPU_SJ_HOST_CALLER(c2, sizeof c2, 2);
+                PPU_SJ_HOST_CALLER(c3, sizeof c3, 3);
                 fprintf(stderr, "[sj] jump blk=0x%08X saved_sp=0x%08X cur_sp=0x%08X "
-                                "r3=0x%08X tid=%llu\n", b, (uint32_t)saved_sp,
-                        (uint32_t)cur_sp, (uint32_t)ctx->gpr[3],
+                                "r3=0x%08X r4=0x%08X r5=0x%08X tid=%llu "
+                                "caller1=%s caller2=%s caller3=%s\n", b,
+                        (uint32_t)saved_sp, (uint32_t)cur_sp,
+                        (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                        (uint32_t)ctx->gpr[5],
+                        (unsigned long long)ctx->thread_id, c1, c2, c3);
+#else
+                fprintf(stderr, "[sj] jump blk=0x%08X saved_sp=0x%08X cur_sp=0x%08X "
+                                "r3=0x%08X r4=0x%08X r5=0x%08X tid=%llu\n", b,
+                        (uint32_t)saved_sp, (uint32_t)cur_sp,
+                        (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                        (uint32_t)ctx->gpr[5],
                         (unsigned long long)ctx->thread_id);
+#endif
+            }
         }
         g_vcall_sp = s->vcsp;
         g_vcall_depth = s->vcdepth;

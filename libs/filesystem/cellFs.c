@@ -126,6 +126,38 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
     if (!ps3_path || !host_buf || buf_size == 0)
         return -1;
 
+    /* Runtime VFS override: some titles reach this module for write-side calls
+     * (rename/unlink) that the read-side guest FS (ppu_fs) already resolves
+     * against PS3_HDD0_ROOT / PS3_VFS_ROOT.  Without this the toolkit's
+     * ./gamedata mapping was used, so GT6's PDI loader could not rename
+     * UPDATENODEINFO.upd into place and the update never became visible to
+     * the game process.  Only active when the runtime roots are configured, so
+     * the toolkit tests keep their historical layout. */
+    {
+        const char* hdd = getenv("PS3_HDD0_ROOT");
+        if (hdd && *hdd && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
+            snprintf(host_buf, buf_size, "%s/%s", hdd, ps3_path + 10);
+            for (char* p = host_buf; *p; p++) {
+#ifdef _WIN32
+                if (*p == '/') *p = '\\';
+#endif
+            }
+            return 0;
+        }
+        const char* vfs = getenv("PS3_VFS_ROOT");
+        if (vfs && *vfs && strncmp(ps3_path, "/dev_bdvd/", 10) == 0) {
+            const char* rest = ps3_path + 10;
+            if (strncmp(rest, "PS3_GAME/", 9) == 0) rest += 9;
+            snprintf(host_buf, buf_size, "%s/%s", vfs, rest);
+            for (char* p = host_buf; *p; p++) {
+#ifdef _WIN32
+                if (*p == '/') *p = '\\';
+#endif
+            }
+            return 0;
+        }
+    }
+
     /* Find longest matching prefix */
     int best = -1;
     size_t best_len = 0;
@@ -933,6 +965,13 @@ s32 cellFsRename(const char* from, const char* to)
 
     ensure_parent_dirs(host_to);
 
+#ifdef _WIN32
+    /* POSIX rename(2) replaces an existing destination; the MSVC CRT rename
+     * fails with EEXIST instead.  GT6's PDI loader renames UPDATENODEINFO.upd
+     * over the existing UPDATENODEINFO, so without this the updated node list
+     * is never installed. */
+    remove(host_to);
+#endif
     if (rename(host_from, host_to) != 0) {
         printf("[cellFs] Rename: rename('%s', '%s') failed: %s\n",
                host_from, host_to, strerror(errno));

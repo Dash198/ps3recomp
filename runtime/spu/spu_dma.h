@@ -562,6 +562,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+    {   /* SPURS_LSWATCH=<hex LS addr>: name any DMA that overwrites that LS
+         * word. GT6's wid=5/6 policy module has its own code zeroed during the
+         * run (synthesised stop at LS 0x3648), so this finds the transfer. */
+        static int64_t _w = -2;
+        if (_w == -2) { const char* e = getenv("SPURS_LSWATCH");
+                        _w = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+        if (_w >= 0 && (int64_t)lsa <= _w + 3 && (int64_t)lsa + (int64_t)size > _w) {
+            static int _n = 0;
+            if (_n++ < 32)
+                fprintf(stderr, "[ls-write] GET ea=0x%08X size=%u -> LS 0x%05X (pc=0x%05X img=%d)\n",
+                        (uint32_t)ea, size, lsa, (uint32_t)spu->pc & SPU_LS_MASK, spu->image_id);
+        }
+    }
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -637,6 +650,45 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             extern void spu_lockline_unlock(void);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
+            {   /* SPU_EA_WATCH=<hex>: name a SPU PUT that covers a guest word. */
+                static int64_t _w = -2;
+                if (_w == -2) { const char* e = getenv("SPU_EA_WATCH");
+                                _w = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+                if (_w >= 0 && (int64_t)(uint32_t)ea <= _w + 15 &&
+                    (int64_t)(uint32_t)ea + (int64_t)size > _w) {
+                    static int _n = 0;
+                    if (_n++ < 24) {
+                        int64_t off = _w - (int64_t)(uint32_t)ea;
+                        uint32_t v = 0;
+                        if (off >= 0 && off + 4 <= (int64_t)size)
+                            v = ((uint32_t)ls_ptr[off] << 24) | ((uint32_t)ls_ptr[off+1] << 16) |
+                                ((uint32_t)ls_ptr[off+2] << 8) | ls_ptr[off+3];
+                        fprintf(stderr, "[spu-put] ea=0x%08X size=%u img=%d pc=%05X "
+                                "watch=0x%llX val=%08X\n", (uint32_t)ea, size,
+                                spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                                (unsigned long long)_w, v);
+                    }
+                }
+            }
+            {   /* SPURS_NOTIFY_DBG=1: the SPURS PM publishes 16-byte notification
+                 * records through an MFC PUT whose EA it composes from the
+                 * kernel-context descriptor at LS 0x210. Log the composed EA and
+                 * suppress the copy, so a guessed descriptor can be calibrated
+                 * without writing 16 bytes at an unknown guest address. */
+                static int _nd = -1;
+                if (_nd < 0) _nd = getenv("SPURS_NOTIFY_DBG") ? 1 : 0;
+                if (_nd && spu->policy_mode && size == 16) {
+                    static int _n = 0;
+                    if (_n++ < 48)
+                        fprintf(stderr, "[notify-put] ea=0x%08X hi=0x%08X img=%d "
+                                "pc=%05X data=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                (uint32_t)ea, (uint32_t)(ea >> 32), spu->image_id,
+                                (uint32_t)spu->pc & SPU_LS_MASK,
+                                ls_ptr[0], ls_ptr[1], ls_ptr[2], ls_ptr[3],
+                                ls_ptr[4], ls_ptr[5], ls_ptr[6], ls_ptr[7]);
+                    goto skip_put;
+                }
+            }
             uint32_t a0 = (uint32_t)ea & ~127u;
             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
             int span_reserved = 0;
@@ -663,6 +715,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     if (a == a1) break;
                 }
             }
+        skip_put: ;
         }
         /* Tell whoever is listening where this PUT landed.
          *
@@ -752,6 +805,22 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         }
 
         if (stall_notify) {
+            /* SPU_LIST_NO_PARK=1: this runtime executes MFC lists SYNCROHOUSLY
+             * inside `wrch MFC_Cmd`, so a parked list can only be resumed from
+             * an interrupt -- and the lifted module runs an entire function body
+             * between trampoline boundaries, so the interrupt can never be taken
+             * at the point the list parks (measured: the drain hook never once
+             * observes `list_stall_mask` set while image 5 is running). The
+             * module therefore waits forever on a list that only an ack could
+             * resume, and the ack itself is interrupt-driven.
+             *
+             * Completing the remaining elements inline and raising the event as
+             * a pure notification is the model-consistent alternative: it is
+             * what "synchronous list execution" means for the rest of this file.
+             * Default OFF so the parking path stays the documented behaviour. */
+            static int _np = -1;
+            if (_np < 0) _np = getenv("SPU_LIST_NO_PARK") ? 1 : 0;
+            if (!_np) {
             uint32_t t = tag & 0x1F;
             spu->list_stall_elem_lsa[t]  = (el + 8) & SPU_LS_MASK;
             spu->list_stall_remaining[t] = num_left - i - 1;
@@ -784,6 +853,14 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                         spu->ls[0x12A4], spu->ls[0x12A5],
                         spu->ls[0x12A6], spu->ls[0x12A7]); }
             return 0;
+            }   /* !_np */
+            /* _np: fall through and keep transferring the remaining elements. */
+            spu->event_status |= 0x2u;              /* notify, but do not park */
+            spu->list_stall_stat |= (1u << (tag & 0x1F));
+            { static int _n = 0; if (_n++ < 8)
+                fprintf(stderr, "[mfc-list] NO-PARK img=%d tag=%u elem@0x%05X "
+                        "left=%u dest=0x%05X (SN raised, continuing)\n",
+                        spu->image_id, tag & 0x1F, el, num_left - i - 1, dest_lsa); }
         }
     }
     return 0;

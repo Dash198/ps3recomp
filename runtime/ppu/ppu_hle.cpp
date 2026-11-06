@@ -191,8 +191,238 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+
+/* --- Optional HLE call ring (diagnostic; PS3_HLE_RING=1) -------------------
+ * The title's boot ends in a script-driven teardown. Keep the last N HLE calls
+ * and a per-NID (count, last caller lr, last return) table, then dump both when
+ * the title starts shutting down. Default off: no recording, no extra work. */
+namespace {
+struct HleRingEntry { uint32_t nid, tid, lr, cia, r3, r4, r5, ret; };
+enum { HLE_RING_SIZE = 512, HLE_STAT_MAX = 1024 };
+HleRingEntry g_hle_ring[HLE_RING_SIZE];
+unsigned     g_hle_ring_next = 0;
+struct HleStat { uint32_t nid, count, last_lr, last_tid, last_ret; };
+HleStat  g_hle_stats[HLE_STAT_MAX];
+unsigned g_hle_stat_n = 0;
+int      g_hle_ring_enabled = -1;   /* -1 = env not read yet */
+bool     g_hle_ring_dumped  = false;
+
+/* Phase 1.3: every non-zero HLE return, in call order. The last-512 ring is
+ * enough to name the shutdown frame but not enough to prove which early call
+ * returned an error, so keep a bounded chronological log of failures. */
+enum { HLE_NONZERO_MAX = 8192 };
+struct HleNonzero { uint32_t seq, nid, tid, lr, r3, r4, r5, ret; };
+HleNonzero g_hle_nonzero[HLE_NONZERO_MAX];
+unsigned   g_hle_nonzero_n = 0;
+unsigned   g_hle_nonzero_total = 0;
+
+/* Phase 1.9: first few cellPadGetData output buffers, captured after the
+ * handler so we can see whether the pad is neutral (len/buttons/sticks). */
+enum { HLE_PAD_SAMPLES = 4, HLE_PAD_BYTES = 0x24 };
+struct HlePadSample { uint32_t tid, buf, nread; uint8_t data[HLE_PAD_BYTES]; };
+HlePadSample g_hle_pad[HLE_PAD_SAMPLES];
+unsigned     g_hle_pad_n = 0;
+
+/* Phase 2.1: snapshot the guest stack at the last sysutil callback and the
+ * last pad poll. Walking the PPC64 back-chain at those two points names the
+ * script loop and the frame that decides to leave it. */
+enum { HLE_STACK_BYTES = 0x600 };
+struct HleStackSample {
+    uint32_t valid, tid, sp, lr, cia;
+    uint8_t  data[HLE_STACK_BYTES];
+};
+HleStackSample g_hle_cb_stack;
+HleStackSample g_hle_pad_stack;
+
+static void hle_capture_stack(HleStackSample& s, ppu_context* c)
+{
+    uint32_t sp = (uint32_t)c->gpr[1];
+    if (sp < 0x10000u || sp > 0xFFFFF000u) return;
+    s.valid = 1;
+    s.tid = (uint32_t)c->thread_id;
+    s.sp = sp;
+    s.lr = (uint32_t)c->lr;
+    s.cia = (uint32_t)c->cia;
+    for (unsigned i = 0; i < HLE_STACK_BYTES; i++)
+        s.data[i] = vm_read8(sp + i);
+}
+
+static void hle_dump_stack(FILE* f, const char* name, const HleStackSample& s)
+{
+    if (!s.valid) { fprintf(f, "# %s: (not captured)\n", name); return; }
+    fprintf(f, "# %s: tid=%u sp=0x%08X lr=0x%08X cia=0x%08X\n",
+            name, s.tid, s.sp, s.lr, s.cia);
+    /* PPC64 ELFv1: back-chain at +0, saved LR at +0x10. Walk up to 24 frames. */
+    uint32_t sp = s.sp;
+    for (unsigned i = 0; i < 24; i++) {
+        uint32_t off = sp - s.sp;
+        if (off + 0x18 > HLE_STACK_BYTES) break;
+        uint32_t next = ((uint32_t)s.data[off + 0] << 24) |
+                        ((uint32_t)s.data[off + 1] << 16) |
+                        ((uint32_t)s.data[off + 2] << 8)  |
+                        ((uint32_t)s.data[off + 3]);
+        uint32_t lr   = ((uint32_t)s.data[off + 0x10] << 24) |
+                        ((uint32_t)s.data[off + 0x11] << 16) |
+                        ((uint32_t)s.data[off + 0x12] << 8)  |
+                        ((uint32_t)s.data[off + 0x13]);
+        fprintf(f, "#   frame %u sp=0x%08X lr=0x%08X\n", i, sp, lr);
+        if (next <= sp || next - s.sp >= HLE_STACK_BYTES) break;
+        sp = next;
+    }
+}
+
+void hle_ring_dump(const char* why, uint32_t at_nid, uint32_t at_lr)
+{
+    if (g_hle_ring_dumped) return;
+    g_hle_ring_dumped = true;
+    const char* path = getenv("PS3_HLE_RING_OUT");
+    if (!path || !*path) path = "hle_ring.txt";
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# ps3recomp HLE ring: %s at nid=0x%08X lr=0x%08X\n", why, at_nid, at_lr);
+    fprintf(f, "# nid tid lr cia r3 r4 r5 ret (oldest first)\n");
+    unsigned start = (g_hle_ring_next > HLE_RING_SIZE) ? (g_hle_ring_next - HLE_RING_SIZE) : 0;
+    for (unsigned i = start; i != g_hle_ring_next; i++) {
+        const HleRingEntry& e = g_hle_ring[i % HLE_RING_SIZE];
+        fprintf(f, "%08X %u %08X %08X %08X %08X %08X %08X\n",
+                e.nid, e.tid, e.lr, e.cia, e.r3, e.r4, e.r5, e.ret);
+    }
+    fprintf(f, "# stats: nid count last_lr last_tid last_ret\n");
+    for (unsigned i = 0; i < g_hle_stat_n; i++)
+        fprintf(f, "%08X %u %08X %u %08X\n",
+                g_hle_stats[i].nid, g_hle_stats[i].count,
+                g_hle_stats[i].last_lr, g_hle_stats[i].last_tid,
+                g_hle_stats[i].last_ret);
+
+    fprintf(f, "# nonzero returns: total=%u shown=%u seq nid tid lr r3 r4 r5 ret\n",
+            g_hle_nonzero_total, g_hle_nonzero_n);
+    for (unsigned i = 0; i < g_hle_nonzero_n; i++) {
+        const HleNonzero& z = g_hle_nonzero[i];
+        fprintf(f, "%u %08X %u %08X %08X %08X %08X %08X\n",
+                z.seq, z.nid, z.tid, z.lr, z.r3, z.r4, z.r5, z.ret);
+    }
+
+    /* The script runner reads +0xA0 of the singleton at 0x17073F0; the
+     * module-loop branch reads the two bytes at 0x1707588/9. Dump the object
+     * state at shutdown so the ledger can distinguish "script never
+     * initialised the module system" from "script did, then returned". */
+    fprintf(f, "# globals: 0x1707490=%u 0x1707588=%u 0x1707589=%u\n",
+            (unsigned)vm_read8(0x1707490u),
+            (unsigned)vm_read8(0x1707588u),
+            (unsigned)vm_read8(0x1707589u));
+    fprintf(f, "# singleton 0x17073F0: +00=%08X +04=%08X +08=%08X +24=%08X +28=%08X +2C=%08X"
+               " +A0=%u +A4=%u +A8=%u +AC=%u\n",
+            vm_read32(0x17073F0u), vm_read32(0x17073F4u), vm_read32(0x17073F8u),
+            vm_read32(0x1707414u), vm_read32(0x1707418u), vm_read32(0x170741Cu),
+            (unsigned)vm_read8(0x1707490u), (unsigned)vm_read8(0x1707494u),
+            (unsigned)vm_read8(0x1707498u), (unsigned)vm_read8(0x170749Cu));
+    fprintf(f, "# globals 0x1707580: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+            vm_read32(0x1707580u), vm_read32(0x1707584u), vm_read32(0x1707588u),
+            vm_read32(0x170758Cu), vm_read32(0x1707590u), vm_read32(0x1707594u),
+            vm_read32(0x1707598u), vm_read32(0x170759Cu));
+
+    fprintf(f, "# pad samples: %u\n", g_hle_pad_n);
+    for (unsigned i = 0; i < g_hle_pad_n; i++) {
+        const HlePadSample& p = g_hle_pad[i];
+        fprintf(f, "#  sample %u tid=%u buf=0x%08X:", i, p.tid, p.buf);
+        for (unsigned j = 0; j < HLE_PAD_BYTES; j++)
+            fprintf(f, " %02X", p.data[j]);
+        fprintf(f, "\n");
+    }
+    hle_dump_stack(f, "last cellSysutilCheckCallback", g_hle_cb_stack);
+    hle_dump_stack(f, "last cellPadGetData", g_hle_pad_stack);
+    fclose(f);
+}
+} /* namespace */
+
+struct HleRingGuard {
+    unsigned slot;
+    uint32_t nid, lr, r3, r4, r5;
+    ppu_context* c;
+    HleRingGuard(uint32_t n, ppu_context* cc) : slot(0), nid(n), lr(0), r3(0), r4(0), r5(0), c(cc) {
+        if (g_hle_ring_enabled < 0) {
+            const char* e = getenv("PS3_HLE_RING");
+            g_hle_ring_enabled = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (!g_hle_ring_enabled) return;
+        /* Snapshot the guest stack at entry, before the HLE handler runs. The
+         * callback's own frame is the one that tells us which script loop is
+         * polling sysutil; overwriting on every call keeps the last one. */
+        if (n == 0x189A74DAu) hle_capture_stack(g_hle_cb_stack, cc);
+        if (n == 0x8B72CDA1u) hle_capture_stack(g_hle_pad_stack, cc);
+        slot = g_hle_ring_next++ % HLE_RING_SIZE;
+        HleRingEntry& e = g_hle_ring[slot];
+        lr = (uint32_t)cc->lr;
+        r3 = (uint32_t)cc->gpr[3];
+        r4 = (uint32_t)cc->gpr[4];
+        r5 = (uint32_t)cc->gpr[5];
+        e.nid = n;
+        e.tid = (uint32_t)cc->thread_id;
+        e.lr  = lr;
+        e.cia = (uint32_t)cc->cia;
+        e.r3  = r3;
+        e.r4  = r4;
+        e.r5  = r5;
+        e.ret = 0;
+    }
+    ~HleRingGuard() {
+        if (!g_hle_ring_enabled) return;
+        HleRingEntry& e = g_hle_ring[slot];
+        uint32_t ret = (uint32_t)c->gpr[3];
+        e.ret = ret;
+        unsigned i = 0;
+        for (; i < g_hle_stat_n; i++) if (g_hle_stats[i].nid == nid) break;
+        if (i == g_hle_stat_n) {
+            if (g_hle_stat_n >= HLE_STAT_MAX) return;
+            g_hle_stat_n++;
+            g_hle_stats[i].nid = nid;
+            g_hle_stats[i].count = 0;
+        }
+        g_hle_stats[i].count++;
+        g_hle_stats[i].last_lr = lr;
+        g_hle_stats[i].last_tid = (uint32_t)c->thread_id;
+        g_hle_stats[i].last_ret = ret;
+
+        /* Phase 1.3: chronological non-zero return log. A CELL_OK of 0 is the
+         * overwhelming majority, so recording only failures keeps this small
+         * even on a multi-minute boot. Bounded so a hot error path cannot fill
+         * guest RAM or the host heap. */
+        if (ret != 0) {
+            g_hle_nonzero_total++;
+            if (g_hle_nonzero_n < HLE_NONZERO_MAX) {
+                HleNonzero& z = g_hle_nonzero[g_hle_nonzero_n++];
+                z.seq = g_hle_nonzero_total;
+                z.nid = nid;
+                z.tid = e.tid;
+                z.lr  = lr;
+                z.r3  = r3;
+                z.r4  = r4;
+                z.r5  = r5;
+                z.ret = ret;
+            }
+        }
+
+        /* Phase 1.9: after the handler, copy the pad output buffer. The
+         * pointer is the entry r4 (cellPadGetData(port, CellPadData*)). */
+        if (nid == 0x8B72CDA1u && ret == 0 && r4 >= 0x10000u &&
+            g_hle_pad_n < HLE_PAD_SAMPLES) {
+            HlePadSample& p = g_hle_pad[g_hle_pad_n++];
+            p.tid = e.tid;
+            p.buf = r4;
+            p.nread = 0;
+            for (unsigned j = 0; j < HLE_PAD_BYTES; j++)
+                p.data[j] = vm_read8(r4 + j);
+        }
+    }
+};
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    HleRingGuard _hle_ring(nid, ctx);
+    if (g_hle_ring_enabled && (nid == 0x4D9B75D5u || nid == 0x35F22AC3u))
+        hle_ring_dump(nid == 0x4D9B75D5u ? "cellPadEnd" : "cellUsbdEnd",
+                      nid, (uint32_t)ctx->lr);
+
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --

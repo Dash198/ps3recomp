@@ -235,6 +235,7 @@ s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr);
 
 s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads);
+s32 cellSpursGetSpuThreadId(CellSpurs* spurs, u32* thread, u32* nThreads);
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
                               u32 maxContention);
 s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,

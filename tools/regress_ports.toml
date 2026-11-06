@@ -141,7 +141,7 @@ build   = """cmake -S . -B build-gate -G "{generator}" -DCMAKE_C_COMPILER={cc} -
 cmd     = ["build-gate/MyGameRecomp", "../vfs/USRDIR/EMAIN.elf"]
 timeout = 90
 expect  = "timeout"
-env     = { PS3_VFS_ROOT = "../vfs" }
+env     = { PS3_VFS_ROOT = "../vfs", PS3_LWCOND_MODE = "legacy" }
 
 # Occurrence counters that sample host scheduling/throughput rather than a
 # functional call. The golden records the minimum bucket Linux observed; the

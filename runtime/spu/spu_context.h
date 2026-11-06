@@ -637,6 +637,25 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 #endif
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    {   /* SPURS_LSWATCH: report the writer's stack pointer too -- a PM whose
+         * r1 is inside its own code writes its prologue over the PM body. */
+        static int64_t _w = -2;
+        if (_w == -2) { const char* e = getenv("SPURS_LSWATCH");
+                        _w = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+        if (_w >= 0 && (int64_t)lsa <= _w + 15 && (int64_t)lsa + 16 > _w) {
+            static int _n = 0;
+            if (_n++ < 24) {
+                uint32_t _pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+                uint32_t _iw = ((uint32_t)ctx->ls[_pc] << 24) | ((uint32_t)ctx->ls[_pc+1] << 16)
+                             | ((uint32_t)ctx->ls[_pc+2] << 8) | ctx->ls[_pc+3];
+                fprintf(stderr, "[ls-w128] a=%05X pc=%05X iw=%08X r1=%05X lr=%05X img=%d val=%08X.%08X.%08X.%08X\n",
+                        lsa, _pc, _iw,
+                        ctx->gpr[1]._u32[0] & SPU_LS_MASK,
+                        ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->image_id,
+                        val._u32[0], val._u32[1], val._u32[2], val._u32[3]);
+            }
+        }
+    }
     if (__builtin_expect(g_spu_smc_watch != 0, 0))
         spu_ls_write_probe_smc(ctx, lsa, p);
 }
@@ -867,6 +886,28 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             g_spu_trampoline_fn = 0;                            \
             yz_lockstep_tick(ctx);                             \
             spu_task_launch_check((ctx), (void*)_tf);          \
+            { static int _f = -1;                              \
+              if (_f < 0) _f = getenv("PS3_SPU_IRQ_FORCE") ? 1 : 0; \
+              if (_f && (ctx)->policy_mode &&                  \
+                  ((ctx)->event_status & 0x2u))                \
+                  (ctx)->int_enable = 1; }                     \
+            { static int _d = -1;                              \
+              if (_d < 0) _d = getenv("PS3_IRQDBG") ? 1 : 0;   \
+              if (_d && (ctx)->policy_mode) {                  \
+                  static int _n = 0;                           \
+                  if ((ctx)->int_enable || ((ctx)->event_status & 0x2u) || \
+                      (ctx)->list_stall_mask) {                \
+                      if (_n++ < 40) {                         \
+                          const uint8_t* _v = (ctx)->ls;       \
+                          uint32_t _w0 = ((uint32_t)_v[0] << 24) | ((uint32_t)_v[1] << 16) | \
+                                         ((uint32_t)_v[2] << 8) | _v[3]; \
+                          fprintf(stderr, "[irqdbg-M] pc=%05X ev=0x%X mask=0x%X ie=%d " \
+                                  "parked=0x%X LS0=%08X op9=%03X\n",      \
+                                  (uint32_t)(ctx)->pc & SPU_LS_MASK,      \
+                                  (ctx)->event_status, (ctx)->event_mask, \
+                                  (ctx)->int_enable, (ctx)->list_stall_mask, \
+                                  _w0, (unsigned)((_w0 >> 23) & 0x1FF)); \
+                          fflush(stderr); } } } }                  \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \

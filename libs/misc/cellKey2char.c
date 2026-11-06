@@ -184,6 +184,19 @@ s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
     return CELL_OK;
 }
 
+s32 cellKey2CharSetArrangement(CellKey2CharHandle handle, s32 arrangement)
+{
+    if (handle >= MAX_K2C_HANDLES || !s_contexts[handle].in_use)
+        return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
+
+    if (arrangement < CELL_KB_MAPPING_101 ||
+        arrangement > CELL_KB_MAPPING_TURKISH_TURKEY)
+        return (s32)CELL_K2C_ERROR_INVALID_PARAMETER;
+
+    s_contexts[handle].arrangement = (u32)arrangement;
+    return CELL_OK;
+}
+
 s32 cellKey2CharSetMode(CellKey2CharHandle handle, s32 mode)
 {
     if (handle >= MAX_K2C_HANDLES || !s_contexts[handle].in_use)

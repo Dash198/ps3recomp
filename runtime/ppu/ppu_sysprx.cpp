@@ -20,10 +20,14 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" uint32_t vm_read32(uint64_t a);
+extern "C" void ps3_request_guest_restart(ppu_context* ctx);
 extern "C" uint64_t vm_read64(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
@@ -352,6 +356,178 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
  * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
  * +0x08 lwcond_queue id. */
+/* Real lwcond state, keyed by the guest lwcond EA.
+ *
+ * LV2 lwcond has NO spurious wakeups, so a guest may check its predicate once
+ * around wait() (GT6's async event API does exactly that). The old 1 ms yield
+ * was a guaranteed spurious wakeup and returned before the worker set
+ * event+0xB4 = 3, so the caller's stack event was reused while still queued.
+ *
+ * Waiter records are per-wait (on the waiter's host stack) and are linked into
+ * the lwcond under its critical section BEFORE the lwmutex is released. signal
+ * wakes exactly one CURRENT waiter; signal with no waiter is a no-op, matching
+ * LV2. In stamp mode the guest lwmutex is not real exclusion, so one stored
+ * wake per lwcond bridges the predicate-check -> enqueue window; create()
+ * clears it, and stack objects re-create their lwcond before each wait.
+ *
+ * PS3_LWCOND_MODE=legacy (or PS3_LWCOND_POLL_MS=<n>) restores the old yield.
+ * PS3_LWCOND_TIMEOUT_MS=<n> caps a real wait (0 = no cap).
+ * PS3_LWCOND_WARN_SEC=<n> logs waits blocked longer than n seconds.
+ */
+#define LWC_MAX 512
+#ifdef _WIN32
+struct LwcWaiter {
+    LwcWaiter* next;
+    HANDLE ev;
+    uint32_t tid;
+    volatile int signaled;
+};
+struct LwcSlot {
+    volatile long ea;
+    volatile long active;
+    volatile long inited;
+    uint32_t lwmutex;
+    LwcWaiter* head;
+    LwcWaiter* tail;
+    volatile long pending;   /* stamp-mode bridge only */
+    CRITICAL_SECTION cs;
+};
+#else
+struct LwcSlot {
+    volatile long ea;
+    volatile long active;
+    volatile long inited;
+    uint32_t lwmutex;
+    volatile long pending;
+    pthread_mutex_t cs;
+};
+#endif
+static LwcSlot g_lwc[LWC_MAX];
+static volatile long g_lwc_tab_lock = 0;
+static void lwc_tab_lock(void)
+{
+#ifdef _WIN32
+    while (_InterlockedExchange(&g_lwc_tab_lock, 1)) YieldProcessor();
+#else
+    while (__sync_lock_test_and_set(&g_lwc_tab_lock, 1)) sched_yield();
+#endif
+}
+static void lwc_tab_unlock(void)
+{
+#ifdef _WIN32
+    _InterlockedExchange(&g_lwc_tab_lock, 0);
+#else
+    __sync_lock_release(&g_lwc_tab_lock);
+#endif
+}
+static LwcSlot* lwc_find(uint32_t ea)
+{
+    if (!ea) return nullptr;
+    for (int i = 0; i < LWC_MAX; i++)
+        if ((uint32_t)g_lwc[i].ea == ea) return &g_lwc[i];
+    return nullptr;
+}
+static LwcSlot* lwc_get(uint32_t ea)
+{
+    LwcSlot* s = lwc_find(ea);
+    if (s) return s;
+    lwc_tab_lock();
+    s = lwc_find(ea);
+    if (!s) {
+        for (int i = 0; i < LWC_MAX; i++) {
+            if (g_lwc[i].ea == 0) {
+                if (!g_lwc[i].inited) {
+#ifdef _WIN32
+                    InitializeCriticalSection(&g_lwc[i].cs);
+#else
+                    pthread_mutex_init(&g_lwc[i].cs, nullptr);
+#endif
+                    g_lwc[i].inited = 1;
+                }
+                g_lwc[i].pending = 0;
+#ifdef _WIN32
+                g_lwc[i].head = g_lwc[i].tail = nullptr;
+#endif
+                g_lwc[i].active = 0;
+                g_lwc[i].ea = (long)ea;      /* publish after init */
+                s = &g_lwc[i];
+                break;
+            }
+        }
+    }
+    lwc_tab_unlock();
+    return s;
+}
+static int lwc_legacy_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* m = getenv("PS3_LWCOND_MODE");
+        if (m && strcmp(m, "legacy") == 0) v = 1;
+        else {
+            const char* p = getenv("PS3_LWCOND_POLL_MS");
+            v = (p && atoi(p) > 0) ? 1 : 0;
+        }
+    }
+    return v;
+}
+static int lwc_timeout_ms(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("PS3_LWCOND_TIMEOUT_MS");
+        v = e ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v > 60000) v = 60000;
+    }
+    return v;
+}
+static int lwc_warn_sec(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("PS3_LWCOND_WARN_SEC");
+        v = e ? atoi(e) : 5;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+/* The GT6 event-wait wrapper (0xB03BAC) never sets r5; it is a leftover value
+ * (observed 0x5C = 92 us). Treating it as the timeout makes every event wait
+ * return before the worker completes, so the worker later dereferences the
+ * caller's torn-down stack context (event+0x64). Ignore the guest timeout for
+ * real-stack waits by default; PS3_LWCOND_GUEST_TIMEOUT=1 restores it. */
+static int lwc_guest_timeout(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("PS3_LWCOND_GUEST_TIMEOUT");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v;
+}
+/* GT6 has two classes of lwcond users:
+ *   - the async event API, whose lwcond lives in a MAIN-STACK event object and
+ *     whose waiter checks its predicate exactly once (must really block);
+ *   - heap/thread-object event queues whose workers poll a predicate with no
+ *     signaler (must keep the old short yield or they park forever).
+ * Until the concurrency map (plan G5) gives a call-site allowlist, block for
+ * real only for lwconds in the main-stack/TLS window; everything else keeps the
+ * legacy 1 ms yield. PS3_LWCOND_REAL_RANGE=<lohex>-<hihex> overrides it. */
+static int lwc_real_ea(uint32_t ea)
+{
+    static uint32_t lo = 0x0E000000u, hi = 0x10000000u;
+    static int init = 0;
+    if (!init) {
+        const char* e = getenv("PS3_LWCOND_REAL_RANGE");
+        if (e && *e) {
+            unsigned int a = 0, b = 0;
+            if (sscanf(e, "%x-%x", &a, &b) == 2 && b > a) { lo = a; hi = b; }
+        }
+        init = 1;
+    }
+    return ea >= lo && ea < hi;
+}
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
@@ -359,51 +535,331 @@ static void sys_lwcond_create(ppu_context* ctx)
     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
     vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
     vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    LwcSlot* s = lwc_get(lwcond);
+    if (s) {
+#ifdef _WIN32
+        EnterCriticalSection(&s->cs);
+        s->lwmutex = lwmutex;
+        s->head = s->tail = nullptr;
+        s->pending = 0;
+        s->active = 1;
+        LeaveCriticalSection(&s->cs);
+#else
+        pthread_mutex_lock(&s->cs);
+        s->lwmutex = lwmutex;
+        s->pending = 0;
+        s->active = 1;
+        pthread_mutex_unlock(&s->cs);
+#endif
+    }
     ctx->gpr[3] = 0;
 }
-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
- * common single (non-recursive) hold. */
+static void sys_lwcond_destroy(ppu_context* ctx)
+{
+    LwcSlot* s = lwc_find((uint32_t)ctx->gpr[3]);
+    if (s) {
+#ifdef _WIN32
+        EnterCriticalSection(&s->cs);
+        int busy = (s->head != nullptr);
+        if (!busy) s->active = 0;
+        LeaveCriticalSection(&s->cs);
+        if (busy) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010010; return; } /* EBUSY */
+#else
+        pthread_mutex_lock(&s->cs);
+        int busy = (s->pending != 0);   /* POSIX fallback has no list */
+        if (!busy) s->active = 0;
+        pthread_mutex_unlock(&s->cs);
+#endif
+    }
+    ctx->gpr[3] = 0;
+}
+static void lwc_signal(ppu_context* ctx, int all, int has_target, uint32_t target_tid)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+#ifdef _WIN32
+    LwcSlot* s = lwc_find(ea);
+    if (s && s->active) {
+        EnterCriticalSection(&s->cs);
+        int woken = 0;
+        {   /* PS3_LWCOND_EA=<hex>: entry/signal trace for one lwcond. */
+            static int _ea = -1;
+            if (_ea < 0) { const char* e = getenv("PS3_LWCOND_EA");
+                           _ea = e ? (int)strtoul(e, 0, 16) : 0; }
+            if (_ea && ea == (uint32_t)_ea)
+                fprintf(stderr, "[LWCOND-EA] signal tid=%llu ea=%08X all=%d waiters=%d lr=%08X\n",
+                        (unsigned long long)ctx->thread_id, ea, all,
+                        s->head ? 1 : 0, (uint32_t)ctx->lr);
+        }
+        if (getenv("PS3_LWCOND_DBG"))
+            fprintf(stderr, "[LWCOND-DBG] signal tid=%llu ea=%08X all=%d waiters=%d lr=%08X\n",
+                    (unsigned long long)ctx->thread_id, ea, all,
+                    s->head ? 1 : 0, (uint32_t)ctx->lr);
+        if (all) {
+            LwcWaiter* w = s->head;
+            s->head = s->tail = nullptr;
+            while (w) {
+                LwcWaiter* n = w->next;
+                w->next = nullptr;
+                w->signaled = 1;
+                SetEvent(w->ev);
+                w = n;
+                woken = 1;
+            }
+        } else if (has_target) {
+            LwcWaiter* prev = nullptr;
+            LwcWaiter* w = s->head;
+            while (w) {
+                if (w->tid == target_tid) {
+                    if (prev) prev->next = w->next; else s->head = w->next;
+                    if (s->tail == w) s->tail = prev;
+                    w->next = nullptr;
+                    w->signaled = 1;
+                    SetEvent(w->ev);
+                    woken = 1;
+                    break;
+                }
+                prev = w; w = w->next;
+            }
+        } else if (s->head) {
+            LwcWaiter* w = s->head;
+            s->head = w->next;
+            if (!s->head) s->tail = nullptr;
+            w->next = nullptr;
+            w->signaled = 1;
+            SetEvent(w->ev);
+            woken = 1;
+        }
+        /* Stamp mode has no real mutex exclusion, so keep one stored wake to
+         * bridge the guest's predicate-check -> wait window. create() resets it.
+         * PS3_LWCOND_PENDING=1 extends that bridge to real mode: GT6's
+         * PDISTD::TickSync sets its own pending flag around this wait, and a
+         * signal landing between its check and the condvar wait is otherwise
+         * lost at the intro->menu transition. */
+        if (!woken && !has_target) {
+            static int _p = -1;
+            if (_p < 0) _p = getenv("PS3_LWCOND_PENDING") ? 1 : 0;
+            if (lwm_stamp_mode() || _p) s->pending = 1;
+        }
+        LeaveCriticalSection(&s->cs);
+    } else if (has_target) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002; /* ESRCH */
+        return;
+    }
+#else
+    (void)all; (void)has_target; (void)target_tid;
+    LwcSlot* s = lwc_find(ea);
+    if (s && s->active) { pthread_mutex_lock(&s->cs); s->pending = 1; pthread_mutex_unlock(&s->cs); }
+#endif
+    ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal(ppu_context* ctx)     { lwc_signal(ctx, 0, 0, 0); }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_signal(ctx, 1, 0, 0); }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_signal(ctx, 0, 1, (uint32_t)ctx->gpr[4]); }
+extern "C" unsigned long long ps3_qpc_us(void);
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+extern "C" void ppu_gcm_pump(void);
+
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
+
+    {   /* PS3_LWCOND_EA=<hex>: log entry/owner for one lwcond.  Used to see who
+         * holds the render-loop TickSync lock when the intro stops. */
+        static int _ea = -1;
+        if (_ea < 0) { const char* e = getenv("PS3_LWCOND_EA");
+                       _ea = e ? (int)strtoul(e, 0, 16) : 0; }
+        if (_ea && lwcond == (uint32_t)_ea)
+            fprintf(stderr, "[LWCOND-EA] enter tid=%llu ea=%08X lwm=%08X owner=%u recur=%u lr=%08X\n",
+                    (unsigned long long)ctx->thread_id, lwcond, lwmutex,
+                    vm_read32(lwmutex + LWM_OWNER), vm_read32(lwmutex + LWM_RECUR),
+                    (uint32_t)ctx->lr);
+    }
+
+    {   /* PS3_LWCOND_STACK_MS=<n>: after n ms, dump the guest call chain of the
+         * first few lwcond waiters.  Used to name the spin the faithful boot
+         * enters once the intro stops flipping. */
+        static int _ms = -2; static unsigned long long _t0; static int _n;
+        if (_ms == -2) { const char* e = getenv("PS3_LWCOND_STACK_MS");
+                         _ms = e ? atoi(e) : 0; }
+        if (_ms > 0) {
+            if (!_t0) _t0 = ps3_qpc_us();
+            if ((ps3_qpc_us() - _t0) / 1000ull >= (unsigned long long)_ms && _n++ < 8) {
+                fprintf(stderr, "[lwc-late] tid=%llu ea=%08X lwm=%08X lr=%08X\n",
+                        (unsigned long long)ctx->thread_id, lwcond, lwmutex,
+                        (uint32_t)ctx->lr);
+                ppu_dump_guest_stack(ctx, "lwc-late");
+            }
+        }
+    }
+
+    if (lwc_legacy_mode()) {
+        const char* p = getenv("PS3_LWCOND_POLL_MS");
+        int poll = p ? atoi(p) : 1;
+        if (poll <= 0) poll = 1;
 #ifdef _WIN32
-    if (lwm_stamp_mode()) {
-        /* Owner-stamp lwmutex: nothing to release; yield the same 1 ms the
-         * POSIX path spends so a guest condvar wait is not a full-core spin. */
+        Sleep((DWORD)poll);
+#else
+        usleep((useconds_t)poll * 1000);
+#endif
+        ctx->gpr[3] = 0;
+        return;
+    }
+
+    if (!lwc_real_ea(lwcond)) {
+        /* Heap/thread-object lwcond: GT6's idle/soc workers poll a predicate
+         * with no signaler. Keep the legacy yield so they cannot park.  If a
+         * real-semaphore lwmutex is bound (PS3_LWMUTEX_STAMP=0), release it
+         * across the poll and reacquire, as the real wait would. */
+#ifdef _WIN32
+        HANDLE legacy_sem = lwm_stamp_mode() ? NULL : lwm_sem(lwmutex);
+        uint32_t legacy_own = 0, legacy_rc = 0;
+        if (legacy_sem && vm_read32(lwmutex + LWM_OWNER) == LWM_SELF(ctx)) {
+            legacy_own = vm_read32(lwmutex + LWM_OWNER);
+            legacy_rc  = vm_read32(lwmutex + LWM_RECUR);
+            vm_write32(lwmutex + LWM_RECUR, 0);
+            vm_write32(lwmutex + LWM_OWNER, 0);
+            ReleaseSemaphore(legacy_sem, 1, NULL);
+        }
         Sleep(1);
-    } else {
-    HANDLE s = lwm_sem(lwmutex);
-    if (s) {
-        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
-        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+        if (legacy_sem && legacy_own) {
+            WaitForSingleObject(legacy_sem, INFINITE);
+            vm_write32(lwmutex + LWM_OWNER, legacy_own);
+            vm_write32(lwmutex + LWM_RECUR, legacy_rc ? legacy_rc : 1);
+        }
+#else
+        usleep(1000);
+#endif
+        ctx->gpr[3] = 0;
+        return;
+    }
+
+#ifdef _WIN32
+    uint32_t self = LWM_SELF(ctx);
+    if (vm_read32(lwmutex + LWM_OWNER) != self || vm_read32(lwmutex + LWM_RECUR) <= 0) {
+        if (getenv("PS3_LWCOND_DBG"))
+            fprintf(stderr, "[LWCOND-DBG] EPERM tid=%llu ea=%08X lwm=%08X owner=%u recur=%u lr=%08X\n",
+                    (unsigned long long)ctx->thread_id, lwcond, lwmutex,
+                    vm_read32(lwmutex + LWM_OWNER), vm_read32(lwmutex + LWM_RECUR),
+                    (uint32_t)ctx->lr);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010009; /* EPERM */
+        return;
+    }
+
+    LwcSlot* s = lwc_find(lwcond);
+    if (!s || !s->active) {
+        /* Unregistered lwcond (CRT/SPURS one-shot): keep a short yield so those
+         * paths cannot hard-block on a signal this HLE does not model. */
+        Sleep(1);
+        ctx->gpr[3] = 0;
+        return;
+    }
+
+    /* A stored wake from stamp mode means the predicate is already true. */
+    EnterCriticalSection(&s->cs);
+    if (s->pending > 0) {
+        s->pending = 0;
+        LeaveCriticalSection(&s->cs);
+        ctx->gpr[3] = 0;
+        return;
+    }
+
+    LwcWaiter w;
+    w.next = nullptr;
+    w.ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    w.tid = (uint32_t)ctx->thread_id;
+    w.signaled = 0;
+    if (!w.ev) {
+        LeaveCriticalSection(&s->cs);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* ENOMEM */
+        return;
+    }
+    if (s->tail) s->tail->next = &w; else s->head = &w;
+    s->tail = &w;
+    LeaveCriticalSection(&s->cs);
+
+    /* Enqueued first, now release the bound lwmutex fully. */
+    HANDLE sem = lwm_stamp_mode() ? NULL : lwm_sem(lwmutex);
+    uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+    uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+    if (sem) {
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
-        ReleaseSemaphore(s, 1, NULL);
-        Sleep(1);
-        WaitForSingleObject(s, INFINITE);
+        ReleaseSemaphore(sem, 1, NULL);
+    }
+
+    uint64_t tmo_us = lwc_guest_timeout() ? ctx->gpr[5] : 0;
+    DWORD ms = INFINITE;
+    if (tmo_us) {
+        uint64_t m = (tmo_us + 999) / 1000;
+        ms = (m > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)m;
+    }
+    int cap = lwc_timeout_ms();
+    if (cap > 0 && (ms == INFINITE || ms > (DWORD)cap)) ms = (DWORD)cap;
+
+    int warn = lwc_warn_sec();
+    int timedout = 0, warned = 0;
+    ULONGLONG start = GetTickCount64();
+    for (;;) {
+        DWORD slice = ms;
+        if (ms != INFINITE) {
+            ULONGLONG el = GetTickCount64() - start;
+            if (el >= ms) { timedout = 1; break; }
+            slice = (DWORD)(ms - el);
+        }
+        if (warn > 0) {
+            DWORD wslice = (DWORD)warn * 1000u;
+            if (slice == INFINITE || slice > wslice) slice = wslice;
+        }
+        /* GT5P's real-lwcond lesson: a guest blocked here never enters HLE,
+         * so a GCM vblank/flip handler that is the only signaller can never
+         * run.  Wake at least every 2 ms and pump callbacks outside the wait. */
+        if (slice == INFINITE || slice > 2) slice = 2;
+        DWORD wr = WaitForSingleObject(w.ev, slice);
+        if (wr != WAIT_TIMEOUT) break;
+        ppu_gcm_pump();
+        ULONGLONG el = GetTickCount64() - start;
+        if (ms != INFINITE && el >= ms) { timedout = 1; break; }
+        if (warn > 0 && !warned && el >= (ULONGLONG)warn * 1000ull) {
+            warned = 1;
+            fprintf(stderr, "[LWCOND-WARN] tid=%llu ea=%08X lwm=%08X lr=%08X waited=%llums\n",
+                    (unsigned long long)ctx->thread_id, lwcond, lwmutex,
+                    (uint32_t)ctx->lr, (unsigned long long)el);
+            fflush(stderr);
+        }
+    }
+
+    EnterCriticalSection(&s->cs);
+    if (!w.signaled) {
+        LwcWaiter* prev = nullptr;
+        LwcWaiter* cur = s->head;
+        while (cur && cur != &w) { prev = cur; cur = cur->next; }
+        if (cur) {
+            if (prev) prev->next = w.next; else s->head = w.next;
+            if (s->tail == &w) s->tail = prev;
+        }
+    }
+    int was_signaled = w.signaled;
+    LeaveCriticalSection(&s->cs);
+    CloseHandle(w.ev);
+
+    if (sem) {
+        WaitForSingleObject(sem, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
-    }
+    ctx->gpr[3] = (timedout && !was_signaled)
+                ? (uint64_t)(int64_t)(int32_t)0x8001000B   /* ETIMEDOUT */
+                : 0;
+    if (getenv("PS3_LWCOND_DBG"))
+        fprintf(stderr, "[LWCOND-DBG] wait tid=%llu ea=%08X lwm=%08X owner=%u recur=%u signal=%d timeout=%d tmo=%llu lr=%08X\n",
+                (unsigned long long)ctx->thread_id, lwcond, lwmutex,
+                vm_read32(lwmutex + LWM_OWNER), vm_read32(lwmutex + LWM_RECUR),
+                was_signaled, timedout, (unsigned long long)tmo_us, (uint32_t)ctx->lr);
 #else
-    /* Non-Windows sys_lwmutex is an owner stamp rather than a real lock, so
-     * there is nothing to release here; yield for the same 1 ms the Windows
-     * path spends instead of returning instantly. A bare return turns every
-     * guest condvar wait into a full-core spin: GT6's two soc workers call
-     * func_00A5F3DC -> sys_lwcond_wait in a loop and read the predicate byte
-     * ~300k times/s ([HOTREAD8] on 0x0169B199/0x0169B279). Guest signals are
-     * predicate-driven, so a timed yield cannot lose a wakeup. */
-    (void)lwmutex;
     usleep(1000);
-#endif
     ctx->gpr[3] = 0;
+#endif
 }
 
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
@@ -880,10 +1336,103 @@ static void sys_spinlock_unlock(ppu_context* ctx)
     _InterlockedExchange(spin_word(ea), 0);
 }
 
-extern "C" void ppu_sysprx_register(void)
+/* ---------------------------------------------------------------------------
+ * PS3_EXITSPAWN_MODE: diagnostic handling for the two process-relaunch
+ * imports.  GT6's PDI/game-data app calls these during boot; the old behavior
+ * was "unresolved NID -> CELL_OK", which tells the guest the relaunch will
+ * happen and then returns into a process that never restarts.
+ *
+ * Default (variable unset): no registration at all, so the unresolved-NID
+ * path is byte-identical to before.
+ *
+ *   PS3_EXITSPAWN_MODE=log   log path/argv and return CELL_OK
+ *   PS3_EXITSPAWN_MODE=err   log and return 0x80010002 (CELL_ENOENT)
+ *   PS3_EXITSPAWN_MODE=busy  log and return 0x8001000B (CELL_EBUSY)
+ * -----------------------------------------------------------------------*/
+static void hle_exitspawn_common(ppu_context* ctx, int npdrm)
 {
-    ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
+    uint32_t path_ea = (uint32_t)ctx->gpr[npdrm ? 4 : 3];
+    uint32_t argv_ea = (uint32_t)ctx->gpr[npdrm ? 5 : 4];
+    char path[256] = {0};
+    if (path_ea) {
+        for (int i = 0; i < 255; i++) {
+            unsigned char c = vm_read8(path_ea + (uint32_t)i);
+            if (!c) break;
+            path[i] = (char)c;
+        }
+    }
+    const char* mode = getenv("PS3_EXITSPAWN_MODE");
+    fprintf(stderr, "[exitspawn] %s path='%s' argv=%08X ra=%08llX mode=%s\n",
+            npdrm ? "npdrm2" : "sys_game2", path, argv_ea,
+            (unsigned long long)ctx->lr, mode ? mode : "?");
+    fprintf(stderr, "[exitspawn] args r3..r10=%08llX %08llX %08llX %08llX %08llX %08llX %08llX %08llX\n",
+            (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
+            (unsigned long long)ctx->gpr[5], (unsigned long long)ctx->gpr[6],
+            (unsigned long long)ctx->gpr[7], (unsigned long long)ctx->gpr[8],
+            (unsigned long long)ctx->gpr[9], (unsigned long long)ctx->gpr[10]);
+    if (argv_ea) {
+        for (int i = 0; i < 8; i++) {
+            uint32_t sp = vm_read32(argv_ea + (uint32_t)i * 4);
+            if (!sp) break;
+            char s[128] = {0};
+            for (int j = 0; j < 127; j++) {
+                unsigned char c = vm_read8(sp + (uint32_t)j);
+                if (!c) break;
+                s[j] = (char)c;
+            }
+            fprintf(stderr, "[exitspawn] argv[%d]=%08X '%s'\n", i, sp, s);
+        }
+    }
+    {
+        uint32_t data_ea = (uint32_t)ctx->gpr[npdrm ? 7 : 6];
+        uint32_t data_sz = (uint32_t)ctx->gpr[npdrm ? 8 : 7];
+        if (data_ea && data_sz && data_sz < 0x4000) {
+            fprintf(stderr, "[exitspawn] data=%08X size=%u:", data_ea, data_sz);
+            for (uint32_t i = 0; i < data_sz && i < 64; i++)
+                fprintf(stderr, " %02X", (unsigned)vm_read8(data_ea + i));
+            fprintf(stderr, "\n");
+        }
+    }
+    fflush(stderr);
+    if (mode && strcmp(mode, "err") == 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002u;  /* ENOENT */
+        return;
+    }
+    if (mode && strcmp(mode, "busy") == 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;  /* EBUSY  */
+        return;
+    }
+    if (mode && strcmp(mode, "exit") == 0) {
+        /* Diagnostic relaunch: terminate the host process with a recognisable
+         * code so the harness can start it again (a fresh process is what the
+         * real syscall does). */
+#ifdef _WIN32
+        ExitProcess(90);
+#else
+        _exit(90);
+#endif
+    }
+    if (mode && strcmp(mode, "soft") == 0) {
+        /* In-process reboot: re-enter the ELF entry with the VM image and the
+         * worker/PDI state preserved (see ppu_run's restart loop). */
+        ps3_request_guest_restart(ctx);
+        return;
+    }
+    ctx->gpr[3] = 0;                                            /* CELL_OK */
+}
+
+static void hle_sys_game_process_exitspawn2(ppu_context* ctx) { hle_exitspawn_common(ctx, 0); }
+static void hle_sceNpDrmProcessExitSpawn2(ppu_context* ctx)   { hle_exitspawn_common(ctx, 1); }
+
+extern "C" void ppu_sysprx_register(void)
+{    ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
     ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
+
+    /* Opt-in only: default leaves both NIDs unresolved (old behavior). */
+    if (getenv("PS3_EXITSPAWN_MODE")) {
+        ps3_hle_register_ctx(0x67F9FEDBu, "sys_game_process_exitspawn2", hle_sys_game_process_exitspawn2);
+        ps3_hle_register_ctx(0xE6C8F3F9u, "sceNpDrmProcessExitSpawn2", hle_sceNpDrmProcessExitSpawn2);
+    }
 
     /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
      * first because the first registration of a NID wins, so these shadow the

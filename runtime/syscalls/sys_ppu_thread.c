@@ -243,6 +243,38 @@ uint64_t ppu_thread_register_main(void)
     return 1;
 }
 
+#ifdef _WIN32
+/* PS3_PPU_PRIO_SCHED=1: map guest lv2 priorities (0 highest .. 3071 lowest)
+ * to host priorities.  GT6's PDISTD::TickSync saves/restores the render
+ * thread's priority with sys_ppu_thread_set_priority (syscall 47) as part of
+ * its tick handshake; with a pure store that handshake does nothing.  The
+ * bands are the GT5P reference's, including PS3_PPU_PRIO_BAND. */
+static int host_sched_on(void)
+{
+    static int n = -1;
+    if (n < 0) { const char* e = getenv("PS3_PPU_PRIO_SCHED"); n = e ? atoi(e) : 0; }
+    return n > 0;
+}
+
+static void host_apply_prio(HANDLE h, int32_t prio)
+{
+    if (!h || !host_sched_on()) return;
+    static int band = -1;
+    if (band < 0) { const char* e = getenv("PS3_PPU_PRIO_BAND"); band = e ? atoi(e) : 220; }
+    int hp = prio <= 1    ? THREAD_PRIORITY_TIME_CRITICAL
+           : prio < band  ? THREAD_PRIORITY_HIGHEST
+           : prio < 400   ? THREAD_PRIORITY_ABOVE_NORMAL
+           : prio < 800   ? THREAD_PRIORITY_NORMAL
+           : prio < 1000  ? THREAD_PRIORITY_BELOW_NORMAL
+           : prio <= 1001 ? THREAD_PRIORITY_LOWEST
+           :                THREAD_PRIORITY_IDLE;
+    SetThreadPriorityBoost(h, TRUE);
+    SetThreadPriority(h, hp);
+    if (getenv("PS3_PPU_PRIO_DBG"))
+        fprintf(stderr, "[prio] host=%p guest=%d host_level=%d\n", (void*)h, prio, hp);
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * sys_ppu_thread_create
  *
@@ -404,9 +436,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d caller_lr=0x%08llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
-            stack_size, priority);
+            stack_size, priority, (unsigned long long)ctx->lr);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */
@@ -460,6 +492,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * ponytail: two host levels only; map the full range if a title needs it. */
     if (priority < 256)
         SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    host_apply_prio(t->host_thread, priority);
 #else
     /* Same reservation, for the same reason. This is the HOST stack the
      * recompiled C frames run on, not the guest stack (allocated above out of
@@ -555,7 +588,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu caller_lr=0x%08llX cia=0x%08llX)\n", (unsigned long long)tid, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -569,6 +602,20 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
     table_unlock();
 
+    /* PS3_JOIN_STACK=1: when a boot/shutdown join stalls, name both sides.
+     * The caller's stack says which teardown path issued the join; the target's
+     * stack says what it is waiting for. A thread stuck in a 100us poll loop is
+     * otherwise invisible -- it never enters an HLE handler after the loop
+     * starts, so the watchdog only shows a pinned LR. */
+    if (getenv("PS3_JOIN_STACK")) {
+        extern void ppu_dump_guest_stack(ppu_context*, const char*);
+        char tag[48];
+        snprintf(tag, sizeof tag, "join-caller tid=%llu", (unsigned long long)tid);
+        ppu_dump_guest_stack(ctx, tag);
+        snprintf(tag, sizeof tag, "join-target tid=%llu", (unsigned long long)tid);
+        ppu_dump_guest_stack(&t->ctx, tag);
+    }
+
     /* Wait for completion */
 #ifdef _WIN32
     WaitForSingleObject(t->finish_event, INFINITE);
@@ -579,6 +626,14 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
     pthread_mutex_unlock(&t->finish_mutex);
 #endif
+
+    /* PS3_JOIN_STATUS=1: report the reaped thread's exit status.  An init or
+     * loader thread that exits non-zero on the faithful cold path otherwise
+     * looks identical to a normal shutdown. */
+    if (getenv("PS3_JOIN_STATUS"))
+        fprintf(stderr, "[WAIT] join ret tid=%llu status_addr=0x%08X exit_status=0x%llX\n",
+                (unsigned long long)tid, status_addr,
+                (unsigned long long)t->exit_status);
 
     /* Write exit status */
     if (status_addr != 0) {
@@ -1155,6 +1210,9 @@ int64_t sys_ppu_thread_set_priority(ppu_context* ctx)
     }
 
     t->priority = priority;
+#ifdef _WIN32
+    host_apply_prio(t->host_thread, priority);
+#endif
     table_unlock();
     return CELL_OK;
 }

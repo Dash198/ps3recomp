@@ -341,8 +341,27 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
 
-    if (type_ea) vm_write32(type_ea, (uint32_t)s_game_type);
-    if (attr_ea) vm_write32(attr_ea, 0);
+    if (type_ea || attr_ea) {
+        /* PS3_GAME_TYPE / PS3_GAME_ATTR: override the CellGameBootCheck
+         * out-params.  GT6's vfs122 is the PSN/HDD build (NPUA81049 + 1.22
+         * patch) but the historical HLE value is DISC, which sends the title's
+         * media-switch logic down the relaunch path.  Defaults keep the old
+         * HLE results so the 1.00 golden is unchanged.
+         *
+         * PS3_GAME_TYPE2 / PS3_GAME_ATTR2 apply only after an in-process soft
+         * relaunch (g_soft_boot_no > 0), to model the system's second-boot
+         * CellGameBootCheck state. */
+        extern int g_soft_boot_no;
+        static int _t = -2, _a = -2, _t2 = -2, _a2 = -2;
+        if (_t == -2) { const char* e = getenv("PS3_GAME_TYPE"); _t = e ? (int)strtoul(e, 0, 0) : (int)s_game_type; }
+        if (_a == -2) { const char* e = getenv("PS3_GAME_ATTR"); _a = e ? (int)strtoul(e, 0, 0) : 0; }
+        if (_t2 == -2) { const char* e = getenv("PS3_GAME_TYPE2"); _t2 = e ? (int)strtoul(e, 0, 0) : _t; }
+        if (_a2 == -2) { const char* e = getenv("PS3_GAME_ATTR2"); _a2 = e ? (int)strtoul(e, 0, 0) : _a; }
+        int eff_t = (g_soft_boot_no > 0) ? _t2 : _t;
+        int eff_a = (g_soft_boot_no > 0) ? _a2 : _a;
+        if (type_ea) vm_write32(type_ea, (uint32_t)eff_t);
+        if (attr_ea) vm_write32(attr_ea, (uint32_t)eff_a);
+    }
 
     if (size_ea) {
         vm_write32(size_ea + 0, (u32)content_free_kb());
@@ -363,7 +382,8 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     s_check_is_disc = (s_game_type == CELL_GAME_GAMETYPE_DISC);
     strncpy(s_check_dir, s_title_id, sizeof(s_check_dir) - 1);
     s_check_dir[sizeof(s_check_dir) - 1] = '\0';
-    printf("[cellGame] BootCheck: type=%u, titleId='%s'\n", s_game_type, s_title_id);
+    printf("[cellGame] BootCheck: type=%u, titleId='%s'\n",
+           type_ea ? (unsigned)vm_read32(type_ea) : (unsigned)s_game_type, s_title_id);
     return CELL_OK;
 }
 

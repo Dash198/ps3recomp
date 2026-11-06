@@ -350,6 +350,11 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
                   ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
                   image_id); }
+    /* Wall time of the job. A job that takes seconds rather than milliseconds
+     * is the frame time; this separates "the SPU work is slow" from "the PPU
+     * never got the completion". */
+    extern unsigned long long ps3_qpc_us(void);
+    unsigned long long _job_t0 = ps3_qpc_us();
     /* NOTE: after its work the job's runtime jumps to LS 0 ("return to the
      * jm2 kernel" -- real layout has the kernel at 0, jobs above; we load the
      * job at 0). That second lap re-enters the job's crt with dead registers
@@ -357,6 +362,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
     spu_run_with_halt(entry, &ctx);
+    { unsigned long long _job_t1 = ps3_qpc_us();
+      static int _tn = 0;
+      if (_tn++ < 24)
+          fprintf(stderr, "[spurs-job] image=%d ran %llums (pc=0x%05X status=0x%X stop=0x%X)\n",
+                  image_id, (unsigned long long)((_job_t1 - _job_t0) / 1000ull),
+                  ctx.pc, ctx.status, ctx.stop_code); }
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
      * the SPU printf service, NOT query results -- value 0x83C0 from the sound

@@ -196,6 +196,7 @@ s32 cellSysutilUnregisterCallback(s32 slot)
  * defers a dialog answer to this pump (which is where hardware delivers it) and
  * must not defer into a pump that never runs. */
 static int s_pump_seen = 0;
+static int s_boot_event_done = 0;
 int cellSysutil_pump_seen(void) { return s_pump_seen; }
 
 s32 cellSysutilCheckCallback(void)
@@ -214,6 +215,20 @@ s32 cellSysutilCheckCallback(void)
           s_pump_seen = 1;
           printf("[cellSysutil] CheckCallback: the title pumps sysutil%c", 10);
       }
+    }
+    /* Diagnostics: some titles only leave their boot wait once the OS has
+     * delivered the first sysutil event (normally DRAWING_BEGIN). Headless
+     * runs have no real OS, so allow an explicit, env-gated one-shot
+     * injection. Kept off by default so the Module 16 golden stays put. */
+    if (!s_boot_event_done && s_callbacks[0].registered) {
+        const char* boot = getenv("PS3_SYSUTIL_BOOT_EVENT");
+        if (boot && boot[0] && strcmp(boot, "0") != 0) {
+            unsigned long status = strtoul(boot, NULL, 0);
+            s_boot_event_done = 1;
+            printf("[cellSysutil] inject boot event status=0x%X param=0 (slot 0)%c",
+                   (unsigned)status, 10);
+            cellSysutilQueueEvent(0, (uint32_t)status, 0);
+        }
     }
     /* Drain the event queue, dispatching each event into guest code via
      * the registered ps3_guest_caller hook. Standard PS3 sysutil callback

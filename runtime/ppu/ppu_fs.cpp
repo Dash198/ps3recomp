@@ -22,12 +22,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <thread>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
  * `extern "C"` inside a function body is ill-formed in C++. */
 extern "C" void ydkj_host_bt(const char* tag);
+
+/* Hybrid boot probe: start the app immediately after the main script is
+ * opened, before the script engine dispatches its first event. */
+extern "C" void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param);
+extern "C" int  cellSysutilCheckCallback(void);
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>          /* open/close on MinGW */
@@ -36,6 +42,19 @@ extern "C" void ydkj_host_bt(const char* tag);
 #endif
 #ifndef O_BINARY
 #define O_BINARY 0       /* POSIX has no text/binary distinction */
+#endif
+
+/* 64-bit stdio positioning. GT.VOL is ~15 GB, so the 32-bit long fseek/ftell
+ * path truncates or fails past 2 GB. These live here (rather than next to the
+ * AIO helpers below) because cellFsLseek/cellFsFstat use them too. */
+#ifdef _WIN32
+#  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     _ftelli64(f)
+#  define HOST_FSEEK64_WHENCE(f,off,wh) _fseeki64((f), (__int64)(off), (wh))
+#else
+#  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     ftello(f)
+#  define HOST_FSEEK64_WHENCE(f,off,wh) fseeko((f), (off_t)(off), (wh))
 #endif
 
 extern "C" uint8_t* vm_base;
@@ -247,6 +266,16 @@ static void cellFsOpen(ppu_context* ctx)
         fprintf(stderr,"[USMBT] open '%s' -> fd %d\n", gpath, fd); fflush(stderr);
         ydkj_host_bt("usm-open");
     }
+    {
+        const char* _hb = getenv("PS3_HYBRID_ON_SCRIPT_OPEN");
+        if (_hb && *_hb == '1' && strstr(gpath, "PDIPFS/9/7L/90")) {
+            fprintf(stderr, "[boot] hybrid-open: queue 0x101 after %s\n", gpath);
+            cellSysutilQueueEvent(0, 0x101, 0);
+            int _r = cellSysutilCheckCallback();
+            fprintf(stderr, "[boot] hybrid-open: check -> %d A0=%02X A4=%02X\n",
+                    _r, vm_read8(0x1796D28 + 0xA0), vm_read8(0x1796D28 + 0xA4));
+        }
+    }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -450,6 +479,10 @@ static void cellFsWrite(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    if (getenv("PS3_FSLOG_WRITE")) {
+        fprintf(stderr, "[fs] write fd=%d '%s' nbytes=%llu -> %zu lr=0x%08X\n",
+                fd, g_fd_path[fd], (unsigned long long)nbytes, n, (uint32_t)ctx->lr);
+    }
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -531,8 +564,11 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
-    long p = ftell(g_files[fd]);
+    if (HOST_FSEEK64_WHENCE(g_files[fd], off, worigin) != 0) {
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+        return;
+    }
+    int64_t p = HOST_FTELL64(g_files[fd]);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -583,10 +619,10 @@ static void cellFsFstat(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    long cur = ftell(g_files[fd]);
-    fseek(g_files[fd], 0, SEEK_END);
-    long sz = ftell(g_files[fd]);
-    fseek(g_files[fd], cur, SEEK_SET);
+    int64_t cur = HOST_FTELL64(g_files[fd]);
+    HOST_FSEEK64_WHENCE(g_files[fd], 0, SEEK_END);
+    int64_t sz = HOST_FTELL64(g_files[fd]);
+    HOST_FSEEK64_WHENCE(g_files[fd], cur, SEEK_SET);
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -595,12 +631,12 @@ static void cellFsFstat(ppu_context* ctx)
     { const char* cap = getenv("FS_FSTAT_CAP");
       const char* only = getenv("FS_FSTAT_CAP_PATH");
       if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
-      if (cap) { long c = strtol(cap, 0, 0);
+      if (cap) { int64_t c = strtoll(cap, 0, 0);
           if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
+              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, (long long)c);
               sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -712,12 +748,6 @@ static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3
  * submit call returns. A title that submits, THEN arms the thing the callback
  * signals, would miss it -- move completion to a worker thread if one shows up.
  */
-#ifdef _WIN32
-#  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
-#else
-#  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
-#endif
-
 static uint32_t guest_be32(uint32_t a)
 {
     if (ppu_vm_size && (uint64_t)a + 4 > ppu_vm_size) return 0;
@@ -727,6 +757,91 @@ static uint32_t guest_be32(uint32_t a)
 static uint64_t guest_be64(uint32_t a)
 {
     return ((uint64_t)guest_be32(a) << 32) | guest_be32(a + 4);
+}
+
+/* cellFsReadWithOffset(fd, offset, buf, nbytes, nread) / WriteWithOffset.
+ *
+ * These are *separate imports* from cellFsRead/cellFsWrite (NID 0x0D5B4A14 for
+ * read), and GT6 uses the read form to pull the first 160 bytes of GT.VOL and
+ * of the update's PDIPFS/K/4D.  Leaving it unimplemented made the generic
+ * unresolved-NID path return CELL_OK without filling the buffer or *nread, so
+ * the engine parsed stale stack bytes as a volume header and took its
+ * one-frame-and-exit path.  Read at an offset like pread: the file position is
+ * saved and restored, so a following sequential read is unaffected. */
+static void cellFsReadWithOffset(ppu_context* ctx)
+{
+    int      fd      = (int)(uint32_t)ctx->gpr[3];
+    uint64_t offset  = ctx->gpr[4];
+    uint32_t buf     = (uint32_t)ctx->gpr[5];
+    uint64_t nbytes  = ctx->gpr[6];
+    uint32_t nread_p = (uint32_t)ctx->gpr[7];
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+    }
+    FILE* f = g_files[fd];
+    int64_t saved = HOST_FTELL64(f);
+    if (HOST_FSEEK64(f, offset) != 0) {
+        if (saved >= 0) HOST_FSEEK64(f, (uint64_t)saved);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+    }
+    if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size)
+        nbytes = ppu_vm_size - buf;
+    fs_prefault(buf, nbytes);
+    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);
+    if (saved >= 0) HOST_FSEEK64(f, (uint64_t)saved);
+    /* A zero-length read at/after EOF where a full block was requested is the
+     * signature of the guest's block loader retrying.  Dump the guest back
+     * chain once so the retry loop can be named. */
+    if (getenv("PS3_FSLOG_ZERO") && n == 0 && nbytes >= 0x80) {
+        static int _z = 0;
+        if (_z++ < 2) {
+            uint32_t sp = (uint32_t)ctx->gpr[1];
+            fprintf(stderr, "[fszero] fd=%d off=%llu want=%llu path=%s sp=0x%08X lr=0x%08X caller_lr=0x%08X\n",
+                    fd, (unsigned long long)offset, (unsigned long long)nbytes,
+                    (fd >= 0 && fd < FS_MAX && g_fd_path[fd][0]) ? g_fd_path[fd] : "?",
+                    sp, (uint32_t)ctx->lr, vm_read32(sp + 0xA0));
+            /* Scan the first 0x400 bytes for text pointers.  The import
+             * wrapper's frame is 0x90 and saves the caller's LR at +0xA0. */
+            for (uint32_t off = 0; off < 0x400; off += 4) {
+                uint32_t v = vm_read32(sp + off);
+                if ((v >= 0x00010000u && v < 0x02000000u) ||
+                    (v >= 0x30000000u && v < 0x40000000u))
+                    fprintf(stderr, "[fszero]   stack +%03X = 0x%08X\n", off, v);
+            }
+        }
+    }
+    if (getenv("PS3_FSLOG_READS")) {
+        static int _n = 0;
+        if (_n++ < 40)
+            fprintf(stderr, "[fsreadoff] fd=%d off=%llu want=%llu got=%zu buf=%08X path=%s\n",
+                    fd, (unsigned long long)offset, (unsigned long long)nbytes, n, buf,
+                    (fd >= 0 && fd < FS_MAX && g_fd_path[fd][0]) ? g_fd_path[fd] : "?");
+    }
+    if (nread_p) vm_write64(nread_p, n);
+    ctx->gpr[3] = CELL_OK;
+}
+
+static void cellFsWriteWithOffset(ppu_context* ctx)
+{
+    int      fd      = (int)(uint32_t)ctx->gpr[3];
+    uint64_t offset  = ctx->gpr[4];
+    uint32_t buf     = (uint32_t)ctx->gpr[5];
+    uint64_t nbytes  = ctx->gpr[6];
+    uint32_t nwr_p   = (uint32_t)ctx->gpr[7];
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+    }
+    FILE* f = g_files[fd];
+    int64_t saved = HOST_FTELL64(f);
+    if (HOST_FSEEK64(f, offset) != 0) {
+        if (saved >= 0) HOST_FSEEK64(f, (uint64_t)saved);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+    }
+    fs_prefault(buf, nbytes);
+    size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+    if (saved >= 0) HOST_FSEEK64(f, (uint64_t)saved);
+    if (nwr_p) vm_write64(nwr_p, n);
+    ctx->gpr[3] = CELL_OK;
 }
 
 static void cellFsAioInit(ppu_context* ctx)   { ctx->gpr[3] = CELL_OK; }
@@ -767,8 +882,39 @@ static void cellFsAioRead(ppu_context* ctx)
                 id, fd, (unsigned long long)offset, (unsigned long long)size, n);
 
     ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+    if (cb_opd) {
+        /* Completion must be ASYNCHRONOUS.  Calling it here runs the guest
+         * callback before cellFsAioRead returns; GT6 1.22's PDI file worker
+         * submits the read and only THEN enqueues its 5 s condition wait, so a
+         * synchronous callback's signal is lost and every frame pays two 5 s
+         * timeouts.  A detached host thread completes after the submit returns,
+         * which is what the real cellFs AIO engine does.  PS3_FS_AIO_ASYNC=0
+         * restores the old synchronous behaviour. */
+        static int s_async = -1;
+        if (s_async < 0) {
+            const char* e = getenv("PS3_FS_AIO_ASYNC");
+            /* Opt-in: the synchronous path is the long-standing shared-runtime
+             * behaviour and the 1.00 golden depends on it.  The 1.22 harness can
+             * set PS3_FS_AIO_ASYNC=1 when a title arms its wait after submit. */
+            s_async = (e && *e == '1');
+        }
+        struct AioDone { uint32_t cb, aio; int32_t err, id; uint64_t n; };
+        AioDone d{cb_opd, aio, err, id, (uint64_t)n};
+        if (s_async) {
+            try {
+                std::thread([d]() {
+                    ps3_invoke_guest(d.cb, d.aio, (uint64_t)(int64_t)d.err,
+                                     (uint64_t)(int64_t)d.id, d.n, 0, 0, 0, 0);
+                }).detach();
+            } catch (...) {
+                ps3_invoke_guest(d.cb, d.aio, (uint64_t)(int64_t)d.err,
+                                 (uint64_t)(int64_t)d.id, d.n, 0, 0, 0, 0);
+            }
+        } else {
+            ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
+                             (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+        }
+    }
 }
 
 extern "C" void ppu_fs_register(void)
@@ -781,6 +927,10 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClose"),    "cellFsClose",    cellFsClose);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsReadWithOffset"),
+                         "cellFsReadWithOffset", cellFsReadWithOffset);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsWriteWithOffset"),
+                         "cellFsWriteWithOffset", cellFsWriteWithOffset);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);

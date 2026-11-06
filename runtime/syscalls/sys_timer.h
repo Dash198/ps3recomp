@@ -49,9 +49,12 @@ typedef struct sys_timer_info {
     int      active;
     int      running;
     uint64_t period_usec;
+    uint64_t first_delay_usec; /* one-shot delay from base_time (0 = now) */
+    int      thread_started;   /* timer thread exists (join on destroy) */
     int32_t  event_queue_id;   /* connected event queue */
     uint64_t source;           /* event source value */
     uint64_t data1;            /* event data1 */
+    uint64_t data2;            /* event data2 */
 
 #ifdef _WIN32
     HANDLE   timer_handle;

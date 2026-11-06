@@ -225,6 +225,12 @@ void rsx_raise_user_cmd(uint32_t arg)
     rsx_send_event(SYS_RSX_EVENT_USER_CMD);
 }
 
+/* Public: the cellGcmInit path (cellGcm_syscall_bringup) does not go through
+ * rsx_driver_info_init, so without this the ISR queue is never created and
+ * every GCM user command is filtered out (qid=0) -- the flip path then parks
+ * waiting for an event nobody can deliver. */
+void rsx_ensure_isr_queue(void) { rsx_isr_queue_bringup(); }
+
 static void rsx_isr_queue_bringup(void)
 {
     if (s_isr_qid) return;

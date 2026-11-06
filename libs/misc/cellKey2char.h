@@ -72,6 +72,9 @@ s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
                                u16* charCode,   /* output char */
                                u32* charNum);   /* number of output chars */
 
+/* Set the keyboard arrangement after opening a handle (1.22 imports it) */
+s32 cellKey2CharSetArrangement(CellKey2CharHandle handle, s32 arrangement);
+
 /* Set/get dead key composition mode */
 s32 cellKey2CharSetMode(CellKey2CharHandle handle, s32 mode);
 s32 cellKey2CharGetMode(CellKey2CharHandle handle, s32* mode);

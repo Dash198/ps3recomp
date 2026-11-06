@@ -8,11 +8,15 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+extern unsigned long long ps3_qpc_us(void);
 
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
+/* Connect intent survives even if the per-object field is lost/reinitialised:
+ * timer_send_event falls back to this map when the object's id reads 0. */
+static int32_t g_timer_conn_q[SYS_TIMER_MAX];
 
 #ifdef _WIN32
 static LARGE_INTEGER s_qpc_freq;
@@ -288,14 +292,17 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-
-    /* Convert QPC to seconds + nanoseconds */
-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    /* Wall clock, not uptime. QueryPerformanceCounter is a monotonic counter
+     * since Windows boot; using it here returned "seconds since boot" where the
+     * guest expects seconds since 1970. Convert the 100 ns FILETIME epoch
+     * (1601-01-01) to Unix time instead. The Linux path already used
+     * CLOCK_REALTIME, so this also removes a platform-dependent semantic. */
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t100 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    t100 -= 116444736000000000ULL;   /* 1601 -> 1970, in 100 ns units */
+    sec  = t100 / 10000000ULL;
+    nsec = (t100 % 10000000ULL) * 100ULL;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -335,18 +342,46 @@ static void timer_send_event(sys_timer_info* t);
 static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    int first = 1;
+    static int _tdbg = -1;
+    if (_tdbg < 0) _tdbg = getenv("PS3_TIMER_DBG") ? 1 : 0;
+    { int id = (int)(t - g_sys_timers) + 1;
+      static int _n = 0;
+      if (_tdbg && _n++ < 16)
+          fprintf(stderr, "[timer-thread] enter id=%d run=%d q=%d first=%llu period=%llu\n",
+                  id, t->running, t->event_queue_id,
+                  (unsigned long long)t->first_delay_usec,
+                  (unsigned long long)t->period_usec); }
 
     while (t->running) {
-        DWORD ms = (DWORD)(t->period_usec / 1000);
-        if (ms == 0) ms = 1;
+        uint64_t us = first
+            ? (t->first_delay_usec ? t->first_delay_usec
+                                   : (t->period_usec ? t->period_usec : 0))
+            : t->period_usec;
+        first = 0;
+        DWORD ms = (DWORD)(us / 1000);
+        if (ms == 0 && us != 0) ms = 1;
 
+        { int id = (int)(t - g_sys_timers) + 1;
+          static int _n = 0;
+          if (_tdbg && _n++ < 24)
+              fprintf(stderr, "[timer-thread] wait id=%d ms=%lu run=%d\n",
+                      id, (unsigned long)ms, t->running); }
         DWORD result = WaitForSingleObject(t->stop_event, ms);
+        { int id = (int)(t - g_sys_timers) + 1;
+          static int _n = 0;
+          if (_tdbg && _n++ < 24)
+              fprintf(stderr, "[timer-thread] woke id=%d res=%lu run=%d\n",
+                      id, (unsigned long)result, t->running); }
         if (result == WAIT_OBJECT_0) {
             break; /* stop signaled */
         }
 
         if (t->running) {
             timer_send_event(t);
+            /* period == 0 is a legal lv2 one-shot timer: fire once at
+             * base_time and stop. */
+            if (t->period_usec == 0) { t->running = 0; break; }
         }
     }
 
@@ -356,13 +391,19 @@ static DWORD WINAPI timer_thread_proc(LPVOID param)
 static void* timer_thread_proc(void* param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    int first = 1;
 
     pthread_mutex_lock(&t->mtx);
     while (!t->stop_flag) {
+        uint64_t us = first
+            ? (t->first_delay_usec ? t->first_delay_usec
+                                   : (t->period_usec ? t->period_usec : 0))
+            : t->period_usec;
+        first = 0;
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(t->period_usec / 1000000);
-        ts.tv_nsec += (long)((t->period_usec % 1000000) * 1000);
+        ts.tv_sec  += (time_t)(us / 1000000);
+        ts.tv_nsec += (long)((us % 1000000) * 1000);
         if (ts.tv_nsec >= 1000000000L) {
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
@@ -374,6 +415,7 @@ static void* timer_thread_proc(void* param)
         if (rc == ETIMEDOUT) {
             pthread_mutex_unlock(&t->mtx);
             timer_send_event(t);
+            if (t->period_usec == 0) { t->running = 0; pthread_mutex_lock(&t->mtx); break; }
             pthread_mutex_lock(&t->mtx);
         }
     }
@@ -383,19 +425,45 @@ static void* timer_thread_proc(void* param)
 }
 #endif
 
+static int timer_dbg(void)
+{
+    static int d = -1;
+    if (d < 0) d = getenv("PS3_TIMER_DBG") ? 1 : 0;
+    return d;
+}
+
 static void timer_send_event(sys_timer_info* t)
 {
-    if (t->event_queue_id <= 0 || t->event_queue_id > SYS_EVENT_QUEUE_MAX)
+    int idx = (int)(t - g_sys_timers);
+    int32_t qid = t->event_queue_id;
+    { static int _f = -1;
+      if (_f < 0) _f = getenv("PS3_TIMER_Q_FALLBACK") ? 1 : 0;
+      if (_f && (qid <= 0 || qid > SYS_EVENT_QUEUE_MAX) &&
+          idx >= 0 && idx < SYS_TIMER_MAX)
+          qid = g_timer_conn_q[idx];
+    }
+    if (qid <= 0 || qid > SYS_EVENT_QUEUE_MAX)
         return;
 
-    sys_event_queue_info* q = &g_sys_event_queues[t->event_queue_id - 1];
+    if (timer_dbg()) {
+        static unsigned long _n[SYS_TIMER_MAX];
+        if (idx >= 0 && idx < SYS_TIMER_MAX) {
+            _n[idx]++;
+            if (_n[idx] <= 8 || (_n[idx] % 1000) == 0)
+                fprintf(stderr, "[timer] send id=%d q=%d n=%lu period=%llu\n",
+                        idx + 1, qid, _n[idx],
+                        (unsigned long long)t->period_usec);
+        }
+    }
+
+    sys_event_queue_info* q = &g_sys_event_queues[qid - 1];
     if (!q->active)
         return;
 
     sys_event_t evt;
     evt.source = t->source;
     evt.data1  = t->data1;
-    evt.data2  = 0;
+    evt.data2  = t->data2;
     evt.data3  = 0;
 
     /* Push event (ignore if queue full) */
@@ -460,6 +528,10 @@ int64_t sys_timer_create(ppu_context* ctx)
         write_be32(id_out_addr, timer_id);
     }
 
+    if (timer_dbg())
+        fprintf(stderr, "[timer] create t=%llu id=%u id_out=%08X lr=%08X\n",
+                ps3_qpc_us(), timer_id, id_out_addr, (uint32_t)ctx->lr);
+
     return CELL_OK;
 }
 
@@ -479,28 +551,53 @@ int64_t sys_timer_destroy(ppu_context* ctx)
     if (!t->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Stop if running */
+    { static int _k = -1;
+      if (_k < 0) _k = getenv("PS3_KEEP_TICKSYNC_TIMER") ? 1 : 0;
+      if (_k && (timer_id == 2 || timer_id == 3)) {
+          fprintf(stderr, "[timer] keep id=%u lr=%08X\n",
+                  timer_id, (uint32_t)ctx->lr);
+          return CELL_OK;
+      }
+    }
+
+    /* Stop if running, but always release handles: a one-shot timer's thread
+     * exits on its own after firing, leaving running == 0. */
     if (t->running) {
         t->running = 0;
 #ifdef _WIN32
         if (t->stop_event) SetEvent(t->stop_event);
-        if (t->thread_handle) {
-            WaitForSingleObject(t->thread_handle, 3000);
-            CloseHandle(t->thread_handle);
-        }
-        if (t->stop_event) CloseHandle(t->stop_event);
 #else
         pthread_mutex_lock(&t->mtx);
         t->stop_flag = 1;
         pthread_cond_signal(&t->cv);
         pthread_mutex_unlock(&t->mtx);
+#endif
+    }
+#ifdef _WIN32
+    if (t->thread_handle) {
+        WaitForSingleObject(t->thread_handle, 3000);
+        CloseHandle(t->thread_handle);
+        t->thread_handle = NULL;
+    }
+    if (t->stop_event) {
+        CloseHandle(t->stop_event);
+        t->stop_event = NULL;
+    }
+#else
+    if (t->thread_started) {
         pthread_join(t->thread, NULL);
         pthread_mutex_destroy(&t->mtx);
         pthread_cond_destroy(&t->cv);
-#endif
     }
+#endif
+    t->thread_started = 0;
 
     t->active = 0;
+
+    if (timer_dbg())
+        fprintf(stderr, "[timer] destroy t=%llu id=%u lr=%08X\n",
+                ps3_qpc_us(), timer_id, (uint32_t)ctx->lr);
+
     return CELL_OK;
 }
 
@@ -518,6 +615,7 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
     uint32_t queue_id = LV2_ARG_U32(ctx, 1);
     uint64_t source   = LV2_ARG_U64(ctx, 2);
     uint64_t data1    = LV2_ARG_U64(ctx, 3);
+    uint64_t data2    = LV2_ARG_U64(ctx, 4);
 
     if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -530,8 +628,16 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     t->event_queue_id = (int32_t)queue_id;
+    g_timer_conn_q[timer_id - 1] = (int32_t)queue_id;
     t->source         = source;
     t->data1          = data1;
+    t->data2          = data2;
+
+    if (timer_dbg())
+        fprintf(stderr, "[timer] connect id=%u q=%u source=%llX data1=%llX data2=%llX lr=%08X\n",
+                timer_id, queue_id, (unsigned long long)source,
+                (unsigned long long)data1, (unsigned long long)data2,
+                (uint32_t)ctx->lr);
 
     return CELL_OK;
 }
@@ -566,8 +672,14 @@ int64_t sys_timer_disconnect_event_queue(ppu_context* ctx)
 int64_t sys_timer_start(ppu_context* ctx)
 {
     uint32_t timer_id    = LV2_ARG_U32(ctx, 0);
-    /* uint64_t base_time = LV2_ARG_U64(ctx, 1); -- ignored for now */
+    uint64_t base_time   = LV2_ARG_U64(ctx, 1);
     uint64_t period      = LV2_ARG_U64(ctx, 2);
+
+    if (timer_dbg())
+        fprintf(stderr, "[timer] start-call t=%llu id=%u period=%llu lr=%08X active=%d running=%d\n",
+                ps3_qpc_us(), timer_id, (unsigned long long)period, (uint32_t)ctx->lr,
+                (timer_id && timer_id <= SYS_TIMER_MAX) ? g_sys_timers[timer_id-1].active : -1,
+                (timer_id && timer_id <= SYS_TIMER_MAX) ? g_sys_timers[timer_id-1].running : -1);
 
     if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -579,11 +691,20 @@ int64_t sys_timer_start(ppu_context* ctx)
     if (t->running)
         return (int64_t)(int32_t)CELL_EBUSY;
 
-    if (period == 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
-
+    /* period == 0 is a legal lv2 one-shot timer: fire once at base_time. */
     t->period_usec = period;
+    t->first_delay_usec = 0;
+    if (base_time) {
+        uint64_t now = ppu_timebase_now();
+        if (base_time > now)
+            t->first_delay_usec = ((base_time - now) / (PS3_TIMEBASE_FREQ / 1000ULL)) * 1000ULL;
+    }
     t->running     = 1;
+
+    if (timer_dbg())
+        fprintf(stderr, "[timer] start id=%u period=%llu first=%llu lr=%08X\n",
+                timer_id, (unsigned long long)period,
+                (unsigned long long)t->first_delay_usec, (uint32_t)ctx->lr);
 
 #ifdef _WIN32
     t->stop_event    = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -592,6 +713,7 @@ int64_t sys_timer_start(ppu_context* ctx)
     t->stop_flag = 0;
     pthread_create(&t->thread, NULL, timer_thread_proc, t);
 #endif
+    t->thread_started = 1;
 
     return CELL_OK;
 }
@@ -616,6 +738,10 @@ int64_t sys_timer_stop(ppu_context* ctx)
         return CELL_OK;
 
     t->running = 0;
+
+    if (timer_dbg())
+        fprintf(stderr, "[timer] stop id=%u lr=%08X\n",
+                timer_id, (uint32_t)ctx->lr);
 
 #ifdef _WIN32
     if (t->stop_event) SetEvent(t->stop_event);

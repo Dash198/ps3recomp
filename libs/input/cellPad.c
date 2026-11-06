@@ -506,6 +506,14 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     { static int _once = 0;
       if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
+    {   /* PS3_PAD_DBG=1: prove the pad is still polled after the intro stops
+         * presenting (is the idle a menu/input wait or a load wait?). */
+        static int _d = -1;
+        if (_d < 0) _d = getenv("PS3_PAD_DBG") ? 1 : 0;
+        if (_d) { static unsigned long _n = 0;
+            if ((++_n % 10000u) == 0)
+                fprintf(stderr, "[padpoll] n=%lu\n", _n); }
+    }
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 

@@ -169,6 +169,21 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     q->type     = SYS_PPU_QUEUE;
     fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
             slot + 1, (unsigned long long)key, size);
+    {   /* PS3_EVT_CREATE_STACK=1: name the guest code that creates a queue.
+         * Event queue 10 is the app's idle waiter; its creator says which
+         * lifecycle subsystem owns it. */
+        static int _cs = -1;
+        if (_cs < 0) _cs = getenv("PS3_EVT_CREATE_STACK") ? 1 : 0;
+        if (_cs) {
+            static int _n = 0;
+            if (_n++ < 16) {
+                char tag[48];
+                snprintf(tag, sizeof tag, "evt-create q=%d", slot + 1);
+                extern void ppu_dump_guest_stack(ppu_context*, const char*);
+                ppu_dump_guest_stack(ctx, tag);
+            }
+        }
+    }
 
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
@@ -221,6 +236,36 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
     if (!q->active) {
         evt_table_unlock();
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
+    }
+
+    /* PS3_EVT_DESTROY_WAKE=1: correct lv2 semantics -- destroying a queue must
+     * release every thread blocked in sys_event_queue_receive (they return
+     * CELL_ECANCELED/ESRCH).  The old path deleted the lock/cond under the
+     * waiters, so they never woke: GT6's render pump (queue 10) stayed parked
+     * forever during 13FD0 and the boot's thread-join chain hung.
+     *
+     * The primitives are deliberately left allocated here: a receiver may
+     * still be inside the critical section on its way out, so deleting them
+     * would be use-after-free.  The slot is memset/InitializeCriticalSection'd
+     * on the next create. */
+    if (getenv("PS3_EVT_DESTROY_WAKE")) {
+#ifdef _WIN32
+        EnterCriticalSection(&q->lock);
+        q->cancelled = 1;
+        q->active = 0;
+        WakeAllConditionVariable(&q->not_empty);
+        LeaveCriticalSection(&q->lock);
+        Sleep(5);                       /* let wakees leave the section */
+#else
+        pthread_mutex_lock(&q->lock);
+        q->cancelled = 1;
+        q->active = 0;
+        pthread_cond_broadcast(&q->not_empty);
+        pthread_mutex_unlock(&q->lock);
+        usleep(5000);
+#endif
+        evt_table_unlock();
+        return CELL_OK;
     }
 
 #ifdef _WIN32
@@ -286,11 +331,43 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
+/* PS3_EVT_RXERR=1: an error return from sys_event_queue_receive does NOT touch
+ * r4..r7, but a guest that only checks r3 (GT6's callback worker does) then
+ * treats the leftover registers as a `sys_event_t` and dispatches a bogus id.
+ * Log the leftovers so a "callback table filled with garbage" report can be
+ * traced back to a failed receive instead of a bad registration. */
+static void evt_rx_err(ppu_context* ctx, uint32_t q, int rc)
+{
+    static int d = -1, n = 0;
+    if (d < 0) d = getenv("PS3_EVT_RXERR") ? 1 : 0;
+    if (d && n++ < 32)
+        fprintf(stderr, "[evt-rxerr] q=%u rc=%d stale r4=%08X r6=%08X lr=%08X tid=%llu\n",
+                q, rc, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[6],
+                (uint32_t)ctx->lr, (unsigned long long)ctx->thread_id);
+}
+
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
+    extern unsigned long long ps3_qpc_us(void);
+    unsigned long long _evt_t0 = ps3_qpc_us();
+    /* Any receive that takes a macroscopic amount of time is the frame cadence
+     * candidate: name the queue, caller and whether it returned an event or
+     * timed out.  PS3_EVT_LONG_MS sets the threshold (default 1000). */
+    static int _evt_long_ms = -1;
+    if (_evt_long_ms < 0) { const char* e = getenv("PS3_EVT_LONG_MS");
+                            _evt_long_ms = e ? atoi(e) : 1000; }
+#define EVT_LONG_LOG(what, rc) do { \
+        unsigned long long _dt = (ps3_qpc_us() - _evt_t0) / 1000ull; \
+        if (_evt_long_ms > 0 && _dt >= (unsigned long long)_evt_long_ms) { \
+            static int _n = 0; if (_n++ < 64) \
+                fprintf(stderr, "[EVT-LONG] q=%u tid=%llu %s waited=%llums " \
+                        "timeout=%llu lr=%08X rc=%d\n", queue_id, \
+                        (unsigned long long)ctx->thread_id, what, _dt, \
+                        (unsigned long long)timeout_us, (uint32_t)ctx->lr, (int)(rc)); } \
+    } while (0)
     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
@@ -346,7 +423,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
       } }
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+        { evt_rx_err(ctx, queue_id, CELL_ESRCH); return (int64_t)(int32_t)CELL_ESRCH; }
     }
 
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
@@ -356,6 +433,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #else
         sched_yield();
 #endif
+        evt_rx_err(ctx, queue_id, CELL_ESRCH);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -477,6 +555,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
         if (q->count == 0 && q->cancelled) {
             LeaveCriticalSection(&q->lock);
+            evt_rx_err(ctx, queue_id, CELL_ECANCELED);
             return (int64_t)(int32_t)CELL_ECANCELED;
         }
     } else if (timeout_us < 1000) {
@@ -489,6 +568,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
          * handles, just without the bogus 15ms stall. */
         if (q->count == 0 || !q->active) {
             LeaveCriticalSection(&q->lock);
+            evt_rx_err(ctx, queue_id, CELL_ETIMEDOUT);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     } else {
@@ -497,6 +577,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     LeaveCriticalSection(&q->lock);
+                    EVT_LONG_LOG("timeout", CELL_ETIMEDOUT);
                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
             }
@@ -505,10 +586,12 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     if (q->count == 0 && q->cancelled) {
         LeaveCriticalSection(&q->lock);
+        evt_rx_err(ctx, queue_id, CELL_ECANCELED);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
     if (!q->active || q->count == 0) {
         LeaveCriticalSection(&q->lock);
+        evt_rx_err(ctx, queue_id, CELL_ESRCH);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -517,6 +600,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     q->count--;
 
     LeaveCriticalSection(&q->lock);
+    EVT_LONG_LOG("event", CELL_OK);
 #else
     pthread_mutex_lock(&q->lock);
 
@@ -569,7 +653,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
-    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && _r++<60) fprintf(stderr,
+    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && _r++<400) fprintf(stderr,
         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
         (unsigned long long)evt.data2); }
@@ -927,6 +1011,12 @@ int64_t sys_event_port_send(ppu_context* ctx)
             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
     if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
             port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
+    { static int dbg = -1; static int n = 0;
+      if (dbg < 0) dbg = getenv("PS3_EVT_SENDDATA") ? 1 : 0;
+      if (dbg && n++ < 32)
+          fprintf(stderr, "[evt-send] port=%u data=%llX/%llX/%llX lr=%08X\n",
+                  port_id, (unsigned long long)data1, (unsigned long long)data2,
+                  (unsigned long long)data3, (uint32_t)ctx->lr); }
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

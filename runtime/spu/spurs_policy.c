@@ -36,6 +36,19 @@ volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
 volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
+/* Bumped by every SPURS entry publish (lifted 0x00B327DC). The kernel turns a
+ * change into a kick so the workload's module runs while the entry is still in
+ * the ring, instead of waiting for the periodic dispatch pass. */
+volatile unsigned g_spurs_push_seq = 0;
+
+/* Called from the lifted producer push (0x00B327DC call site). */
+void spurs_push_kick(void) { g_spurs_push_seq++; }
+
+/* SPURS notification ring write index. Lives here, not in the PM's local store:
+ * SPURS_PM_FRESH zeroes LS on every dispatch, so an index kept only at LS 0x218
+ * resets each run. The kernel owns the index on real hardware. */
+static uint32_t s_spurs_notify_idx = 0;
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
@@ -43,6 +56,24 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 {
     if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
         return -1;
+
+    {   /* SPURS_DISP_STAT=1: authoritative dispatch counter. Every module entry
+         * funnels through this function, so this cannot miss a dispatch the way
+         * a counter at a particular call site can. Prints every 200 entries a
+         * per-wid histogram. */
+        static int _ds = -1; static unsigned long _c[16]; static unsigned long _tot;
+        if (_ds < 0) _ds = getenv("SPURS_DISP_STAT") ? 1 : 0;
+        if (_ds) {
+            _c[wid & 15]++; _tot++;
+            if ((_tot % 200) == 0) {
+                fprintf(stderr, "[disp-stat] total=%lu wids:", _tot);
+                for (int i = 0; i < 16; i++) if (_c[i]) fprintf(stderr, " %d=%lu", i, _c[i]);
+                fprintf(stderr, "\n");
+                fflush(stderr);
+                memset(_c, 0, sizeof _c);
+            }
+        }
+    }
 
     /* Reuse one context per thread: this runs per policy dispatch (thousands
      * per second with the SPURS workload churn live), and a fresh 260KB
@@ -117,6 +148,21 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     /* PM image at its load base (first entry only -- LS persists). */
     if (first)
         memcpy(ctx->ls + 0xA00, pm_host, pm_size);
+    {   /* SPURS_PM_LSDBG=1: verify the PM body really landed in LS at the
+         * addresses the dispatch trace halts on (0x3648 for GT6's image 5). */
+        static int _d = -1; static int _n = 0;
+        if (_d < 0) _d = getenv("SPURS_PM_LSDBG") ? 1 : 0;
+        if (_d && _n++ < 12) {
+            u32 hostw = (u32)pm_host[0x2C48] << 24 | (u32)pm_host[0x2C49] << 16 |
+                        (u32)pm_host[0x2C4A] << 8 | (u32)pm_host[0x2C4B];
+            u32 lsw = (u32)ctx->ls[0x3648] << 24 | (u32)ctx->ls[0x3649] << 16 |
+                      (u32)ctx->ls[0x364A] << 8 | (u32)ctx->ls[0x364B];
+            fprintf(stderr, "[pm-lsdbg] wid=%u first=%d pm=%p size=%u host[0x2C48]=%08X "
+                    "ls[0x3648]=%08X pm0=%02X%02X%02X%02X\n",
+                    wid, first, (void*)pm_host, pm_size, hostw, lsw,
+                    pm_host[0], pm_host[1], pm_host[2], pm_host[3]);
+        }
+    }
 
     /* SpursKernelContext at LS 0x100 (fields big-endian, like all guest data). */
     uint8_t* ls = ctx->ls;
@@ -138,12 +184,132 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     KBE32(0x1C8, spu_num);              /* spuNum (virtual SPU / lane row) */
     KBE32(0x1CC, 8);                    /* dmaTagId (kernel's tag)  */
     KBE32(0x1D0, 0);                    /* wklCurrentAddr hi32 (u64 ptr) */
-    KBE32(0x1D4, 0xA00);                /* wklCurrentAddr lo32 = PM load base */
+    {   /* PS3_SPURS_WKLADDR=1: report the workload's data EA in
+         * wklCurrentAddr instead of the PM load base. The PM reads this field
+         * (its thunk at 0x3680 returns its low word into LS 0x1430) and the
+         * load/stage phase keys off it; GT6's PM never stages (LS 0x12A0 == 0)
+         * with 0xA00 there, so A/B the alternative interpretation. */
+        static int _wa = -1;
+        if (_wa < 0) _wa = getenv("PS3_SPURS_WKLADDR") ? 1 : 0;
+        KBE32(0x1D4, _wa ? (uint32_t)wkl_data : 0xA00);   /* wklCurrentAddr lo32 */
+    }
     KBE32(0x1D8, wid);                  /* wklCurrentUniqueId       */
     KBE32(0x1DC, wid);                  /* wklCurrentId             */
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
     KBE32(0x1E4, SPURS_PM_SELECT_WORKLOAD_LS);
 #undef KBE32
+
+    {   /* The PM's notification publisher (LS 0x3710) returns immediately unless
+         * the kernel-context byte at LS 0x172 is 1, so nothing is ever
+         * published to the PPU when we leave that region zero (we only seed
+         * from 0x1C0). PS3_KCTX17X=<hex byte string> patches 0x170.. so the
+         * gate can be A/B'd; PS3_WKLDATA dumps the region at entry. */
+        static int _d = -1; static int _n = 0;
+        if (_d < 0) _d = getenv("PS3_WKLDATA") ? 1 : 0;
+        if (_d && (wid == 5 || wid == 6) && _n++ < 4)
+            fprintf(stderr, "[kctx170] wid=%u: %02X%02X%02X%02X %02X%02X%02X%02X "
+                    "%02X%02X%02X%02X %02X%02X%02X%02X\n", wid,
+                    ls[0x170], ls[0x171], ls[0x172], ls[0x173], ls[0x174], ls[0x175],
+                    ls[0x176], ls[0x177], ls[0x178], ls[0x179], ls[0x17A], ls[0x17B],
+                    ls[0x17C], ls[0x17D], ls[0x17E], ls[0x17F]);
+        const char* e = getenv("PS3_KCTX17X");
+        if (e && *e) {
+            for (int i = 0; i < 16 && e[0] && e[1]; i++, e += 2) {
+                char b[3] = { e[0], e[1], 0 };
+                ls[0x170 + i] = (uint8_t)strtoul(b, 0, 16);
+            }
+        }
+    }
+
+    {   /* PS3_SPURS_NOTIFY=1: supply the two kernel-context pieces the SPURS PM's
+         * notification publisher needs (see docs/re/gt6_gcm_flips.md 6f):
+         *
+         *   LS 0x175 = 1                    gate 1: "workload enabled"
+         *   LS 0x210 = 16-byte ring desc    gate 2: {EA hi32, base word,
+         *                                          index @8..11, limit @12..15}
+         *
+         * The publisher builds `EAL = ((base + index) << 4)` and `EAH` from the
+         * first word, PUTs a 16-byte record, then bumps the index (wrapping at
+         * `limit`). The descriptor's exact base encoding is calibrated with
+         * SPURS_NOTIFY_DBG, which logs the composed EA and suppresses the copy.
+         * Off by default: a publisher that writes to a guessed EA would corrupt
+         * guest memory. */
+        /* Seed the descriptor only while it is uninitialised. It is a producer
+         * index the PM advances itself (0x378C stores the bumped index back),
+         * so re-seeding would pin it at slot 0 -- and it is per-CONTEXT (one
+         * lane serves several workloads over time), not per-wid. Note `first`
+         * cannot be used: SPURS_PM_FRESH makes it true on every run. */
+        static int _nf = -1;
+        if (_nf < 0) _nf = getenv("PS3_SPURS_NOTIFY") ? 1 : 0;
+        /* The ring's write index lives in GUEST memory, not in LS: SPURS_PM_FRESH
+         * zeroes the local store on every dispatch, so a descriptor index kept
+         * only in LS is reset to 0 each run and every record overwrites slot 0.
+         * The SPURS kernel owns the index, so keep it here and re-supply it. */
+        int seed_now = 0;
+        if (_nf) {
+            int all_zero = 1;
+            for (int i = 0; i < 16; i++) if (ls[0x210 + i]) { all_zero = 0; break; }
+            if (all_zero) seed_now = 1;
+        }
+        if (seed_now) {
+            ls[0x175] = 1;
+            const char* ee = getenv("PS3_SPURS_NOTIFY_EA");
+            uint32_t rea = ee && *ee ? (uint32_t)strtoul(ee, 0, 16) : 0x20040000u;
+            uint32_t base = rea;           /* calibrated: EAL = (word4+index)<<4 */
+            uint32_t lim  = 64;
+            uint32_t idx  = s_spurs_notify_idx % lim;
+            memset(ls + 0x210, 0, 16);
+            ls[0x213] = (uint8_t)(rea >> 32);          /* EA hi32 (0 on PS3) */
+            ls[0x217] = (uint8_t)(base & 0xFF);
+            ls[0x216] = (uint8_t)((base >> 8) & 0xFF);
+            ls[0x215] = (uint8_t)((base >> 16) & 0xFF);
+            ls[0x214] = (uint8_t)((base >> 24) & 0xFF);
+            ls[0x21B] = (uint8_t)(idx & 0xFF);
+            ls[0x21A] = (uint8_t)((idx >> 8) & 0xFF);
+            ls[0x219] = (uint8_t)((idx >> 16) & 0xFF);
+            ls[0x218] = (uint8_t)((idx >> 24) & 0xFF);
+            ls[0x21F] = (uint8_t)(lim & 0xFF);
+            ls[0x21E] = (uint8_t)((lim >> 8) & 0xFF);
+            ls[0x21D] = (uint8_t)((lim >> 16) & 0xFF);
+            ls[0x21C] = (uint8_t)((lim >> 24) & 0xFF);
+            {   /* Ring memory: zero it once so records are attributable. */
+                extern uint8_t* vm_base;
+                static uint32_t cleared = 0;
+                if (vm_base && cleared != rea) {
+                    memset(vm_base + rea, 0, lim * 16u);
+                    cleared = rea;
+                }
+            }
+            { static int _n = 0;
+              if (_n++ < 4 || wid == 5 || wid == 6)
+                  fprintf(stderr, "[pm-notify] wid=%u idx=%u ring=0x%08X base=%08X "
+                          "lim=%u\n", wid, idx, rea, base, lim); }
+        }
+    }
+
+    {   /* PS3_SPURS_SEED_14D0=1: the PM's claim helper (LS 0x23F0) compares the
+         * submission ring's entry-buffer page against the cached page at LS
+         * 0x14D0 and early-outs (r62 == 0, "no load") while they differ. A run
+         * with the ring populated still exits loadState=0 with 0x14D0 == 0, so
+         * seed it with the ring's current entries pointer before dispatch. This
+         * A/B decides whether the page cache is the gate. */
+        static int _sd = -1;
+        if (_sd < 0) _sd = getenv("PS3_SPURS_SEED_14D0") ? 1 : 0;
+        if (_sd) {
+            extern uint8_t* vm_base;
+            u32 d = (u32)wkl_data;
+            if (d >= 0x10000u && d < 0xE0000000u) {
+                const uint8_t* h = vm_base + d + 0x30;
+                u32 page = ((u32)h[0] << 24) | ((u32)h[1] << 16) | ((u32)h[2] << 8) | h[3];
+                ls[0x14D0] = (uint8_t)(page >> 24); ls[0x14D1] = (uint8_t)(page >> 16);
+                ls[0x14D2] = (uint8_t)(page >> 8);  ls[0x14D3] = (uint8_t)page;
+                { static int _n = 0;
+                  if (_n++ < 8)
+                      fprintf(stderr, "[pm-seed] wid=%u entries_page=%08X -> LS 0x14D0\n",
+                              wid, page); }
+            }
+        }
+    }
 
     /* Entry registers per cellSpursModuleEntry. */
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;  /* return-to-kernel link */
@@ -169,6 +335,72 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
+
+    {   /* PS3_RING_SEED=1: put the producer's own entry back into the ring at
+         * policy entry. The PPU only publishes ~6 words per boot, so a real
+         * dispatch almost never coincides with a populated ring (1-2 of ~92).
+         * Seeding makes the condition deterministic and answers the question the
+         * sampling can't: WITH an entry present, does the claim actually consume
+         * it (1450 non-zero, loadState set)? The bytes written are exactly what
+         * PPU_WWATCH recorded the producer storing at 0x17C1780:
+         *   0x00600001 (flag/len)  0x31366F10 (payload EA) */
+        static int _rs = -1;
+        if (_rs < 0) _rs = getenv("PS3_RING_SEED") ? 1 : 0;
+        if (_rs && wid == 6 && wkl_data >= 0x10000u && wkl_data < 0xE0000000u) {
+            extern uint8_t* vm_base;
+            uint32_t ent = 0;
+            uint8_t* b = vm_base + (uint32_t)wkl_data + 0x30;
+            ent = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+                  ((uint32_t)b[2] << 8) | b[3];
+            if (ent >= 0x10000u && ent < 0xE0000000u) {
+                static const uint8_t rec[8] = { 0x00,0x60,0x00,0x01, 0x31,0x36,0x6F,0x10 };
+                for (int i = 0; i < 8; i++) vm_base[ent + (uint32_t)i] = rec[i];
+                { static int _n = 0;
+                  if (_n++ < 4)
+                      fprintf(stderr, "[ring-seed] wid=6 entry0@%08X = 00600001 31366F10\n", ent); }
+            }
+        }
+    }
+
+    {   /* PS3_WKLDATA=1: dump the workload data the PM is handed plus the LS
+         * copy the previous run DMA'd (its GET of 256 bytes lands at 0xB00),
+         * and the instance's ready/signal/state -- the PM's "is there work"
+         * inputs. Only wid 5/6 (GT6's PDI jobmanager). */
+        static int _d = -1; static int _n = 0;
+        if (_d < 0) _d = getenv("PS3_WKLDATA") ? 1 : 0;
+        if (_d && (wid == 5 || wid == 6) && _n++ < 4000) {
+            extern uint8_t* vm_base;
+            const uint8_t* L = ctx->ls;
+            #define BW(o) (((uint32_t)vm_base[(o)]<<24)|((uint32_t)vm_base[(o)+1]<<16)| \
+                           ((uint32_t)vm_base[(o)+2]<<8)|vm_base[(o)+3])
+            #define LW(o) (((uint32_t)L[(o)]<<24)|((uint32_t)L[(o)+1]<<16)| \
+                           ((uint32_t)L[(o)+2]<<8)|L[(o)+3])
+            fprintf(stderr, "[wkldata] wid=%u arg=%08X first=%d lsB00=%08X.%08X.%08X.%08X\n",
+                    wid, (uint32_t)wkl_data, first, LW(0xB00), LW(0xB10), LW(0xB20), LW(0xB30));
+            if (vm_base && wkl_data < 0xE0000000u) {
+                uint32_t a = (uint32_t)wkl_data;
+                for (uint32_t o = 0; o < 0xC0; o += 0x10)
+                    fprintf(stderr, "[wkldata]  +%02X: %08X %08X %08X %08X\n",
+                            o, BW(a + o), BW(a + o + 4), BW(a + o + 8), BW(a + o + 12));
+                uint32_t ent = BW(a + 0x30), idx = BW(a + 0x38);
+                fprintf(stderr, "[wkldata]  ctrl: entries=%08X index=%u\n", ent, idx);
+                if (ent >= 0x10000u && ent < 0xE0000000u) {
+                    fprintf(stderr, "[wkldata]  entries@%08X (at PM ENTRY):", ent);
+                    for (uint32_t o = 0; o < 0x20; o += 4) fprintf(stderr, " %08X", BW(ent + o));
+                    fprintf(stderr, "\n");
+                }
+            }
+            if (spurs_ea) {
+                uint32_t e = spurs_ea;
+                fprintf(stderr, "[wkldata]  inst: ready=%u sig=%04X state=%u flag=%08X en=%08X\n",
+                        vm_base[e + 0x00 + wid],
+                        ((uint32_t)vm_base[e+0x70] << 8) | vm_base[e+0x71],
+                        vm_base[e + 0x80 + wid], BW(e + 0x60), BW(e + 0xB0));
+            }
+            #undef BW
+            #undef LW
+        }
+    }
 
     /* RUN/END tracing: thousands of policy dispatches per second made these
      * unconditional fprintf+fflush pairs a real fraction of movie playback.
@@ -242,8 +474,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * or reset/stall it? Only wid<=1 (jobmanager) traced, first 4000 runs. */
     static int s_pipe = -1;
     if (s_pipe < 0) s_pipe = getenv("SPURS_PM_PIPE") ? 1 : 0;
-    /* trace ALL workloads (the jobmanager is wid=12, not <=1); 4000-run cap bounds volume */
-    int pipe_this = s_pipe && spu_num == 0;
+    /* trace ALL workloads (the jobmanager is wid=12, not <=1); 4000-run cap bounds volume.
+     * wid 5/6 (GT6's PDI workloads) are traced on every lane: they dispatch on
+     * spu_num != 0 here, so the spu_num==0 filter silently hid the pipeline
+     * state for the exact workloads under investigation. */
+    int pipe_this = s_pipe && (spu_num == 0 || wid == 5 || wid == 6);
     uint32_t st_before = 0;
     if (pipe_this) {
         const uint8_t* L = ctx->ls;
@@ -266,6 +501,119 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned claim_before = g_spu_putllc_sync_hit;
 
     const int pm_halted = spu_run_with_halt(entry, ctx);
+    {   /* PS3_BATCH_PUB=1: publish this SPU's consumption progress into the
+         * workload-data batch counters the PPU's probe reads.
+         *
+         * func_00B31F50 returns "no space" while
+         *   min(u16 at wkl_data+0x40 .. +0x4E) < (head + free-run)
+         * (measured: head=1 freerun=2 need=3, counters {1,1,0,-1,-1,-1,-1,-1}
+         * -> min 0 < 3, so the PPU never writes another batch). On hardware the
+         * SPU consumer bumps its own lane's counter as it drains entries; our
+         * runtime has to do that in the kernel after each policy-module pass.
+         * Only the lane this dispatch ran on is advanced, so a lane that is
+         * genuinely stuck still blocks -- this publishes progress rather than
+         * declaring it. */
+        static int _bp = -1;
+        if (_bp < 0) _bp = getenv("PS3_BATCH_PUB") ? 1 : 0;
+        if (_bp && wkl_data >= 0x10000u && wkl_data < 0xE0000000u && spu_num < 8) {
+            extern uint8_t* vm_base;
+            uint8_t* lane = vm_base + (uint32_t)wkl_data + 0x40u;
+            #define RD16(p) (((unsigned)(p)[0] << 8) | (unsigned)(p)[1])
+            #define WR16(p, v) do { (p)[0] = (uint8_t)((v) >> 8); (p)[1] = (uint8_t)(v); } while (0)
+            unsigned head = RD16(lane);
+            if (head == 0xFFFFu) head = 0;
+            unsigned cur = RD16(lane + spu_num * 2u);
+            if (cur == 0xFFFFu) cur = 0;
+            if (head > cur) {
+                WR16(lane + spu_num * 2u, head);
+                { static int _n = 0;
+                  if (_n++ < 8)
+                      fprintf(stderr, "[batch-pub] wid=%u spu=%u %u -> %u\n",
+                              wid, spu_num, cur, head); }
+            }
+            #undef RD16
+            #undef WR16
+        }
+    }
+    {   /* Harvest the index the PM advanced to, so the next (fresh-LS) dispatch
+         * resumes at the next ring slot instead of overwriting slot 0. */
+        static int _hf = -1;
+        if (_hf < 0) _hf = getenv("PS3_SPURS_NOTIFY") ? 1 : 0;
+        if (_hf && !(ls[0x210] | ls[0x211] | ls[0x212] | ls[0x213]))
+            s_spurs_notify_idx = ((uint32_t)ls[0x218] << 24) | ((uint32_t)ls[0x219] << 16) |
+                                 ((uint32_t)ls[0x21A] << 8) | ls[0x21B];
+    }
+    {   /* PS3_WKLDATA: what the run left in the LS input buffer (0xB00) and
+         * the ring control/entries -- shows whether the PM read the submitted
+         * entry and what it decided. */
+        static int _d = -1; static int _n2 = 0;
+        if (_d < 0) _d = getenv("PS3_WKLDATA") ? 1 : 0;
+        if (_d && (wid == 5 || wid == 6) && _n2++ < 600) {
+            extern uint8_t* vm_base;
+            const uint8_t* L = ctx->ls;
+            #define LW(o) (((uint32_t)L[(o)]<<24)|((uint32_t)L[(o)+1]<<16)| \
+                           ((uint32_t)L[(o)+2]<<8)|L[(o)+3])
+            #define BW(o) (((uint32_t)vm_base[(o)]<<24)|((uint32_t)vm_base[(o)+1]<<16)| \
+                           ((uint32_t)vm_base[(o)+2]<<8)|vm_base[(o)+3])
+            fprintf(stderr, "[wkdata-end] wid=%u pc=%05X exited=%u lsB00:", wid,
+                    (uint32_t)ctx->pc & SPU_LS_MASK, g_spurs_pm_exited);
+            for (uint32_t o = 0; o < 0x50; o += 4) fprintf(stderr, " %08X", LW(0xB00 + o));
+            fprintf(stderr, "\n");
+            /* The claim helper (LS 0x23F0) GETLLARs 128 bytes of the workload
+             * data to MFC_LSA=0x80. That buffer -- not 0xB00 -- is what the
+             * claim scan reads, so dump it verbatim: if it is stale/zero the
+             * GET never landed, and if it matches guest but the scan still
+             * reports empty, the field it keys on is the one to publish. */
+            fprintf(stderr, "[wkdata-end] wid=%u ls80:", wid);
+            for (uint32_t o = 0; o < 0x80; o += 4) fprintf(stderr, " %08X", LW(0x80 + o));
+            fprintf(stderr, "\n");
+            /* LS 0xD00 is the PM's local copy of the entry array: the claim
+             * helper does `lqx r3, 0xD00, offset` and returns 0 on an all-zero
+             * slot. If guest entries exist but this copy is zero, the GET that
+             * fills it is the missing piece. */
+            fprintf(stderr, "[wkdata-end] wid=%u lsD00:", wid);
+            for (uint32_t o = 0; o < 0x80; o += 4) fprintf(stderr, " %08X", LW(0xD00 + o));
+            fprintf(stderr, "\n");
+            /* The PM's pipeline state words: loadState (0x12A0) plus the
+             * request/stage registers it copies into/out of. Dumping them at
+             * exit shows which one the "no work" branch keyed on. */
+            fprintf(stderr, "[wkdata-end] wid=%u state: 12A0=%08X 12C0=%08X "
+                    "12D0=%08X 12E0=%08X 12F0=%08X 1300=%08X 1340=%08X 1420=%08X "
+                    "1430=%08X 1440=%08X 1450=%08X 1460=%08X 14D0=%08X 14E0=%08X "
+                    "1510=%08X 1520=%08X 1530=%08X 0210=%08X\nextra: %08X %08X %08X\n",
+                    wid, LW(0x12A0), LW(0x12C0), LW(0x12D0), LW(0x12E0), LW(0x12F0),
+                    LW(0x1300), LW(0x1340), LW(0x1420), LW(0x1430), LW(0x1440),
+                    LW(0x1450), LW(0x1460), LW(0x14D0), LW(0x14E0), LW(0x1510),
+                    LW(0x1520), LW(0x1530), LW(0x210),
+                    LW(0x214), LW(0x218), LW(0x21C));
+            if (vm_base && wkl_data >= 0x10000u && wkl_data < 0xE0000000u) {
+                uint32_t a = (uint32_t)wkl_data - 0x70;   /* control block */
+                fprintf(stderr, "[wkdata-end] ctrl@%08X:", a);
+                for (uint32_t o = 0; o < 0x60; o += 4) fprintf(stderr, " %08X", BW(a + o));
+                fprintf(stderr, "\n");
+                uint32_t ent = BW((uint32_t)wkl_data + 0x30);
+                if (ent >= 0x10000u && ent < 0xE0000000u) {
+                    fprintf(stderr, "[wkdata-end] entries@%08X:", ent);
+                    for (uint32_t o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", BW(ent + o));
+                    fprintf(stderr, "\n");
+                    /* The claim helper, when ceqhi(entry,1) is zero, fetches 16
+                     * bytes from (entry[1] & ~15) and treats the byte at +14 as
+                     * the "consumable" flag. Dump that payload so we can see
+                     * which status the guest has published. */
+                    for (uint32_t k = 0; k < 4; k++) {
+                        uint32_t pl = BW(ent + k * 8u + 4u);
+                        if (pl < 0x10000u || pl >= 0xE0000000u) continue;
+                        uint32_t pa = pl & ~15u;
+                        fprintf(stderr, "[wkdata-end] payload%d@%08X:", k, pa);
+                        for (uint32_t o = 0; o < 16; o += 4) fprintf(stderr, " %08X", BW(pa + o));
+                        fprintf(stderr, "  byte14=%02X\n", vm_base[pa + 14]);
+                    }
+                }
+            }
+            #undef LW
+            #undef BW
+        }
+    }
     /* A lane's run should only end through exitToKernel. Anything else strands
      * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
@@ -305,7 +653,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          * own budget so wid=12's pipeline is always captured. */
         static unsigned long s_pn_wid[16] = {0};
         unsigned long s_pn = ++s_pn_wid[wid & 15];
-        if (s_pn < 300) {
+        unsigned long cap = (wid == 5 || wid == 6) ? 4000ul : 300ul;
+        if (s_pn < cap) {
             const uint8_t* L = ctx->ls;
             #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])
             #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
