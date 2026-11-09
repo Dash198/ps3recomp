@@ -3173,6 +3173,33 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
             fn = fn2;
         }
     }
+    /* PS3_ICALL_MISS=1: report indirect targets that are not function entries.
+     *
+     * ppu_lookup() is an exact-match hash, so a `bctr` into a jump-table case
+     * label (mid-function) resolves to nothing and the call becomes a silent
+     * no-op.  That is the signature of the 1.00 ADCH value-reader bug
+     * (gt6-adch-switch-dispatch.patch, bctr at 0x987910), so naming these
+     * misses -- with the containing function and the guest caller -- is how a
+     * second, still-unpatched dispatch shows itself. */
+    if (!fn) {
+        static int _m = -1;
+        static int _n = 0;
+        if (_m < 0) _m = getenv("PS3_ICALL_MISS") ? 1 : 0;
+        if (_m && _n++ < 64) {
+            uint32_t best = 0;
+            for (uint64_t k = 0; k < function_table_count; k++) {
+                uint32_t a = (uint32_t)function_table[k].addr;
+                if (a <= addr && a > best) best = a;
+            }
+            char from[64]; from[0] = 0;
+            ppu_guest_caller(from, sizeof from);
+            fprintf(stderr, "[icall-miss] target=%08X tid=%u from=%s "
+                            "nearest=func_%08X+0x%X\n",
+                    addr, (unsigned)ctx->thread_id, from, best,
+                    best ? (addr - best) : 0u);
+            fflush(stderr);
+        }
+    }
     if (fn) {
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
