@@ -91,6 +91,10 @@ s32 cellFiberPpuAttributeInitialize(CellFiberAttribute* attr);
 s32 cellFiberPpuSleep(void);
 s32 cellFiberPpuWakeup(CellFiber fiber);
 
+/* GT6 1.22 context API (see cellFiber.c).  Registers the four Context NIDs
+ * that the generated HLE table does not cover. */
+void cellFiber_register_context(void);
+
 #ifdef __cplusplus
 }
 #endif

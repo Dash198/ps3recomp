@@ -459,3 +459,142 @@ s32 cellFiberPpuWakeup(CellFiber fiber)
     s_fibers[idx].state = CELL_FIBER_STATE_INITIALIZED; /* ready to run */
     return CELL_OK;
 }
+
+/* ---------------------------------------------------------------------------
+ * CellFiberPpuContext API
+ *
+ * GT6 1.22 imports the *context* API (not the fiber API above).  The context
+ * is a 640-byte object owned by the caller, with a caller-supplied guest
+ * stack.  RPCS3 only stubs it, so the ABI below is taken from its header:
+ *   entry(u64 arg, CellFiberPpuContext* fiberFrom)
+ *   ContextRun(ctx, s32* cause, Context** fiberFrom, option*)
+ *   ContextReturnToThread(s32 cause)
+ *
+ * First implementation: run the entry synchronously through ppu_guest_call
+ * (which supplies a scratch guest stack).  This executes the menu's fiber
+ * entry at least once and proves whether it is the missing script path; real
+ * save/resume can be layered on once we see how it yields.
+ * -------------------------------------------------------------------------*/
+
+extern uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1,
+                               uint64_t a2, uint64_t a3, uint64_t a4,
+                               uint64_t a5, uint64_t a6, uint64_t a7);
+extern void ps3_hle_register(uint32_t nid, const char* name, void* handler);
+
+typedef struct FiberCtxSlot {
+    u32 ea;
+    u64 entry;
+    u64 arg;
+    u32 stack_ea;
+    u32 stack_size;
+    int ran;
+} FiberCtxSlot;
+
+static FiberCtxSlot s_ctxs[16];
+
+static FiberCtxSlot* ctx_find(u32 ea)
+{
+    for (int i = 0; i < 16; i++)
+        if (s_ctxs[i].ea == ea && ea != 0) return &s_ctxs[i];
+    return NULL;
+}
+
+static FiberCtxSlot* ctx_alloc(void)
+{
+    for (int i = 0; i < 16; i++)
+        if (s_ctxs[i].ea == 0) return &s_ctxs[i];
+    return NULL;
+}
+
+u64 _cellFiberPpuContextAttributeInitialize(u64 attr, u64 sdkVersion,
+                                            u64 a2, u64 a3, u64 a4,
+                                            u64 a5, u64 a6, u64 a7)
+{
+    (void)sdkVersion; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    if (!attr) return 0x80760011u;
+    for (u32 i = 0; i < 128; i += 4) vm_write32((u32)attr + i, 0);
+    fprintf(stderr, "[cellFiber] ContextAttributeInitialize(attr=%08X)\n", (u32)attr);
+    return 0;
+}
+
+u64 cellFiberPpuContextInitialize(u64 context, u64 entry, u64 arg,
+                                  u64 stack_ea, u64 stack_size, u64 attr,
+                                  u64 a6, u64 a7)
+{
+    (void)attr; (void)a6; (void)a7;
+    if (!context || !entry || !stack_ea) return 0x80760011u;
+    FiberCtxSlot* c = ctx_find((u32)context);
+    if (!c) c = ctx_alloc();
+    if (!c) return 0x80760004u;   /* CELL_FIBER_ERROR_NOMEM */
+    c->ea = (u32)context;
+    c->entry = entry;
+    c->arg = arg;
+    c->stack_ea = (u32)stack_ea;
+    c->stack_size = (u32)stack_size;
+    c->ran = 0;
+    fprintf(stderr, "[cellFiber] ContextInitialize(ctx=%08X entry=%08X arg=%llX stack=%08X size=%X attr=%08X)\n",
+           (u32)context, (u32)entry, (unsigned long long)arg,
+           (u32)stack_ea, (u32)stack_size, (u32)attr);
+    return 0;
+}
+
+u64 cellFiberPpuContextRun(u64 context, u64 cause, u64 fiberFrom, u64 option,
+                           u64 a4, u64 a5, u64 a6, u64 a7)
+{
+    (void)option; (void)a4; (void)a5; (void)a6; (void)a7;
+    FiberCtxSlot* c = ctx_find((u32)context);
+    if (!c) {
+        fprintf(stderr, "[cellFiber] ContextRun(ctx=%08X): not initialized\n", (u32)context);
+        return 0x80760002u;
+    }
+    static int _en = -1;
+    if (_en < 0) _en = getenv("PS3_CELLFIBER_CTX") ? 1 : 0;
+    if (_en && !c->ran) {
+        c->ran = 1;
+        fprintf(stderr, "[cellFiber] ContextRun(ctx=%08X) -> entry %08X arg %llX\n",
+               (u32)context, (u32)c->entry, (unsigned long long)c->arg);
+        u64 r = ppu_guest_call((u32)c->entry, c->arg, (u32)context,
+                               0, 0, 0, 0, 0, 0);
+        fprintf(stderr, "[cellFiber] ContextRun(ctx=%08X) entry returned %llX\n",
+               (u32)context, (unsigned long long)r);
+    }
+    if (cause) vm_write32((u32)cause, 0);
+    if (fiberFrom) vm_write32((u32)fiberFrom, 0);
+    return 0;
+}
+
+u64 cellFiberPpuContextReturnToThread(u64 cause, u64 a1, u64 a2, u64 a3,
+                                      u64 a4, u64 a5, u64 a6, u64 a7)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    fprintf(stderr, "[cellFiber] ContextReturnToThread(cause=%d)\n", (int)cause);
+    return 0;
+}
+
+u64 cellFiberPpuContextFinalize(u64 context, u64 a1, u64 a2, u64 a3,
+                                u64 a4, u64 a5, u64 a6, u64 a7)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    FiberCtxSlot* c = ctx_find((u32)context);
+    if (c) { c->ea = 0; c->ran = 0; }
+    fprintf(stderr, "[cellFiber] ContextFinalize(ctx=%08X)\n", (u32)context);
+    return 0;
+}
+
+/* The four Context NIDs are not in the generated HLE table (the library only
+ * exported the fiber API when it was built).  Register them explicitly; the
+ * port calls this after ppu_hle_init(). */
+void cellFiber_register_context(void)
+{
+    ps3_hle_register(0x31252EC3u, "_cellFiberPpuContextAttributeInitialize",
+                     (void*)_cellFiberPpuContextAttributeInitialize);
+    ps3_hle_register(0x72086315u, "cellFiberPpuContextInitialize",
+                     (void*)cellFiberPpuContextInitialize);
+    ps3_hle_register(0xABA1C563u, "cellFiberPpuContextRun",
+                     (void*)cellFiberPpuContextRun);
+    ps3_hle_register(0x01036193u, "cellFiberPpuContextReturnToThread",
+                     (void*)cellFiberPpuContextReturnToThread);
+    ps3_hle_register(0xB3A48079u, "cellFiberPpuContextFinalize",
+                     (void*)cellFiberPpuContextFinalize);
+    fprintf(stderr, "[cellFiber] Context API registered (5 NIDs)\n");
+}

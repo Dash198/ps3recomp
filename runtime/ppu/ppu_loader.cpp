@@ -3206,8 +3206,18 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
          * and blow the host stack. Cap the depth, log once, then unwind. */
         if (g_vcall_depth > 4000) {
             static int warned = 0;
-            if (warned++ < 8)
+            static int _dd = -1; if (_dd < 0) _dd = getenv("PS3_DEPTH_DUMP") ? 1 : 0;
+            if (warned++ < 8) {
                 fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, g_vcall_depth);
+                if (_dd && warned == 1) {
+                    fprintf(stderr, "[depth] r3=%08X r4=%08X r5=%08X last vcalls (oldest first):\n",
+                            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
+                    for (int i = 64; i > 0; i--) {
+                        uint32_t a = g_vcall_stk[(g_vcall_sp - i) & 127];
+                        if (a) fprintf(stderr, "[depth]   %08X\n", a);
+                    }
+                }
+            }
             return;
         }
         g_vcall_depth++;
@@ -3221,6 +3231,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
         uint32_t _toc0 = (uint32_t)ctx->gpr[2];
         static int _tf=-1; if(_tf<0)_tf=getenv("PPU_TOCFIX")?1:0;
         if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
+        g_vcall_stk[g_vcall_sp & 127] = addr;
         g_vcall_sp++;
         fn(ctx);
         while (g_trampoline_fn) {
