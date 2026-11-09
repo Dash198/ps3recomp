@@ -3204,7 +3204,12 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
          * and blow the host stack. Cap the depth, log once, then unwind. */
-        if (g_vcall_depth > 4000) {
+        static int _vmax = -1;
+        if (_vmax < 0) {
+            const char* e = getenv("PS3_VCALL_MAX");
+            _vmax = e ? atoi(e) : 4000;
+        }
+        if (g_vcall_depth > _vmax) {
             static int warned = 0;
             static int _dd = -1; if (_dd < 0) _dd = getenv("PS3_DEPTH_DUMP") ? 1 : 0;
             if (warned++ < 8) {
