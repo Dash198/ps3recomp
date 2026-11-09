@@ -188,6 +188,20 @@ static void ppu_pc_ring_dump(const char* tag)
     fflush(stderr);
 }
 
+/* Called from the runner's stack-overflow VEH. g_active_ctx is the crashing
+ * thread's context (TLS), so this reports that thread's guest stack and PC
+ * ring even though the host stack is exhausted. */
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd */
+extern "C" ppu_context* g_ppu_main_ctx = nullptr;        /* set by ppu_run */
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+extern "C" void ppu_crash_dump(const char* tag)
+{
+    ppu_context* c = g_active_ctx ? g_active_ctx : g_ppu_main_ctx;
+    if (c) ppu_dump_guest_stack(c, tag ? tag : "crash");
+    if (g_active_ctx) ppu_pc_ring_dump(tag ? tag : "crash");
+    fflush(stderr);
+}
+
 /* ---------------------------------------------------------------------------
  * Guest-pointer trap
  *
@@ -4274,6 +4288,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * sys_mutex -- LBP's main + bringup threads both held the GCM lock at once
      * and concurrently-emitted fences vanished (the boot-loading stall). */
     ctx.thread_id = main_tid;
+    g_ppu_main_ctx = &ctx;
 
     /* PS3 process-entry ABI: the loader hands _start register state the CRT
      * (_initialize) consumes directly:

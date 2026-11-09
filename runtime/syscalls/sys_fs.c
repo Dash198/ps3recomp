@@ -284,6 +284,9 @@ int64_t sys_fs_open(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    { extern char* getenv(const char*);
+      if (ps3_path && strstr(ps3_path, "projects/"))
+          fprintf(stderr, "[sysfs] open '%s' -> '%s'\n", ps3_path, host_path); }
 
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
