@@ -581,6 +581,15 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
 
+    { static int _d = -1;
+      if (_d < 0) _d = getenv("PS3_FSLSEEK_DBG") ? 1 : 0;
+      if (_d) {
+          static int _n = 0;
+          if (_n++ < 200)
+              fprintf(stderr, "[cellFs] Lseek(fd=%d, off=%lld, whence=%d)\n",
+                      (int)fd, (long long)offset, (int)whence);
+      } }
+
     if (s_files[fd].host_fp) {
         int host_whence = SEEK_SET;
         if (whence == CELL_FS_SEEK_CUR) host_whence = SEEK_CUR;
