@@ -524,15 +524,42 @@ static HWND create_window(u32 width, u32 height, const char* title)
     RECT wr = {0, 0, (LONG)width, (LONG)height};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
+    /* PC-friendly window activation.  By default the window is shown with
+     * WS_VISIBLE, which makes Windows activate it; unattended emulator runs
+     * then steal keyboard focus from other applications.
+     *
+     *   PS3_WINDOW_NO_FOCUS=1 : show with SW_SHOWNOACTIVATE (no focus grab,
+     *                           clicking the window still activates it).
+     *   PS3_WINDOW_HIDDEN=1   : never show the window (headless testing).
+     */
+    const char* _nf = getenv("PS3_WINDOW_NO_FOCUS");
+    const char* _hd = getenv("PS3_WINDOW_HIDDEN");
+    int no_focus = (_nf && *_nf && *_nf != '0');
+    int hidden   = (_hd && *_hd && *_hd != '0');
+    DWORD style  = WS_OVERLAPPEDWINDOW;
+    if (!no_focus && !hidden) style |= WS_VISIBLE;
+
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-    return CreateWindowExA(
-        0, "ps3recomp_d3d12",
-        title ? title : "ps3recomp (D3D12)",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        wr.right - wr.left, wr.bottom - wr.top,
-        NULL, NULL, GetModuleHandle(NULL), NULL);
+    {
+        HWND hwnd = CreateWindowExA(
+            no_focus ? WS_EX_NOACTIVATE : 0, "ps3recomp_d3d12",
+            title ? title : "ps3recomp (D3D12)",
+            style,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            wr.right - wr.left, wr.bottom - wr.top,
+            NULL, NULL, GetModuleHandle(NULL), NULL);
+        if (hwnd && no_focus && !hidden) {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            /* Allow a later user click to activate the window normally. */
+            SetWindowLongPtrA(hwnd, GWL_EXSTYLE,
+                              GetWindowLongPtrA(hwnd, GWL_EXSTYLE) & ~(LONG_PTR)WS_EX_NOACTIVATE);
+        }
+        fprintf(stderr, "[rsx] window mode: %s\n",
+                hidden ? "hidden" : (no_focus ? "no-focus" : "normal"));
+        fflush(stderr);
+        return hwnd;
+    }
 }
 
 /* ---------------------------------------------------------------------------

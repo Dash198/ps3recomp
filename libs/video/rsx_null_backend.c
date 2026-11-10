@@ -8,6 +8,7 @@
 
 #include "rsx_null_backend.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../../runtime/ps3_log.h"
 
@@ -251,10 +252,19 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     RECT wr = {0, 0, (LONG)width, (LONG)height};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
+    /* See rsx_d3d12_backend.c: PS3_WINDOW_NO_FOCUS=1 shows without activating,
+     * PS3_WINDOW_HIDDEN=1 keeps the window hidden for unattended runs. */
+    const char* _nf = getenv("PS3_WINDOW_NO_FOCUS");
+    const char* _hd = getenv("PS3_WINDOW_HIDDEN");
+    int no_focus = (_nf && *_nf && *_nf != '0');
+    int hidden   = (_hd && *_hd && *_hd != '0');
+    DWORD style  = WS_OVERLAPPEDWINDOW;
+    if (!no_focus && !hidden) style |= WS_VISIBLE;
+
     s_state.hwnd = CreateWindowExA(
-        0, "ps3recomp_null",
+        no_focus ? WS_EX_NOACTIVATE : 0, "ps3recomp_null",
         title ? title : "ps3recomp",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        style,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
@@ -263,6 +273,13 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
         return -1;
     }
+    if (no_focus && !hidden) {
+        ShowWindow(s_state.hwnd, SW_SHOWNOACTIVATE);
+        SetWindowLongPtrA(s_state.hwnd, GWL_EXSTYLE,
+                          GetWindowLongPtrA(s_state.hwnd, GWL_EXSTYLE) & ~(LONG_PTR)WS_EX_NOACTIVATE);
+    }
+    printf("[RSX null] window mode: %s\n",
+           hidden ? "hidden" : (no_focus ? "no-focus" : "normal"));
 
     s_state.hdc = GetDC(s_state.hwnd);
     s_state.last_fps_time = GetTickCount64();
