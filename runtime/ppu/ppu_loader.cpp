@@ -3342,8 +3342,19 @@ static void ps3_indirect_call_impl(ppu_context* ctx, void* ra)
         return;   /* don't spam the log on a tight retry loop */
     }
     last = cur; streak = 0;
-    fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X (tid=%llu lr=0x%08X)\n",
-            (uint32_t)ctx->ctr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    /* Spam guard: a bad boot can have several worker threads retrying a
+     * garbage OPD in rotation, which defeats the identical-target streak
+     * check above and can produce hundreds of MB of log in minutes. */
+    { static unsigned _ucap = 0;
+      if (_ucap < 64u) {
+          _ucap++;
+          fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X (tid=%llu lr=0x%08X)\n",
+                  (uint32_t)ctx->ctr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+      } else if (_ucap == 64u) {
+          _ucap++;
+          fprintf(stderr, "[ppu] unresolved indirect call: further messages suppressed\n");
+          fflush(stderr);
+      } }
     /* With no NID table the very first one of these is the expected outcome
      * rather than a mystery, so name the cause instead of the symptom. */
     { extern uint32_t ps3_hle_count(void);
