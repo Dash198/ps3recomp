@@ -4305,7 +4305,9 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     int boot_no = 0;
     for (;;) {
     g_soft_boot_no = boot_no;
-    ppu_context ctx;
+    /* Static: g_ppu_main_ctx must stay a valid address for out-of-thread
+     * samplers even across soft reboots.  memset below reinitializes it. */
+    static ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.gpr[1] = stack_top;   /* stack pointer */
 

@@ -1361,3 +1361,22 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_PPU_THREAD_GET_STACK_INFORMATION, sys_ppu_thread_get_stack_information);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_RENAME,              sys_ppu_thread_rename);
 }
+
+/* PS3_PC_SAMPLE: dump the live guest thread table without suspending any
+ * host thread.  The main-context pointer is not stable across the run, but
+ * g_ppu_threads is a static array owned by this file. */
+void ppu_dump_thread_pcs(void)
+{
+    for (int i = 0; i < PPU_THREAD_MAX; i++) {
+        ppu_thread_info* t = &g_ppu_threads[i];
+        if (t->state != PPU_THREAD_STATE_RUNNING &&
+            t->state != PPU_THREAD_STATE_DETACHED) continue;
+        ppu_context* c = &t->ctx;
+        fprintf(stderr,
+                "[pcsample] tid=%d state=%d name='%s' cia=%08X lr=%08X sp=%08X r3=%08X r4=%08X\n",
+                i + 1, t->state, t->name[0] ? t->name : "?",
+                (unsigned)c->cia, (unsigned)c->lr, (unsigned)c->gpr[1],
+                (unsigned)c->gpr[3], (unsigned)c->gpr[4]);
+    }
+    fflush(stderr);
+}
